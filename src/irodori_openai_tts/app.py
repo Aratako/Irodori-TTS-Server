@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from functools import partial
@@ -13,7 +15,7 @@ import torch
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from irodori_tts.inference_runtime import SamplingRequest, SamplingResult
@@ -298,11 +300,7 @@ def delete_voice(voice_id: str) -> dict[str, Any]:
 @app.post("/v1/audio/speech", dependencies=[Depends(require_auth)])
 async def create_speech(payload: SpeechRequest) -> Response:
     _validate_speech_payload(payload)
-    if payload.stream_format is not None and str(payload.stream_format).lower() == "sse":
-        raise HTTPException(
-            status_code=400,
-            detail="stream_format='sse' is not supported by this non-streaming model.",
-        )
+    stream_as_sse = _stream_format_is_sse(payload.stream_format)
 
     try:
         response_format = normalize_response_format(
@@ -328,6 +326,15 @@ async def create_speech(payload: SpeechRequest) -> Response:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except TypeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if stream_as_sse:
+        return _stream_speech_response(
+            sampling_request,
+            chunks,
+            response_format,
+            request_started_at,
+        )
+
     try:
         runtime = await _run_blocking(runtime_manager.get)
     except RuntimeLoadTimeoutError as exc:
@@ -369,6 +376,18 @@ async def create_speech(payload: SpeechRequest) -> Response:
         content=audio_bytes,
         media_type=CONTENT_TYPES[response_format],
         headers=headers,
+    )
+
+
+def _stream_format_is_sse(stream_format: str | None) -> bool:
+    if stream_format is None:
+        return False
+    value = str(stream_format).strip().lower()
+    if value == "sse":
+        return True
+    raise HTTPException(
+        status_code=400,
+        detail="stream_format must be 'sse' when specified.",
     )
 
 
@@ -550,6 +569,132 @@ async def _synthesize_chunks(
         used_seed=results[0].used_seed,
         messages=messages,
     )
+
+
+def _stream_speech_response(
+    sampling_request: SamplingRequest,
+    chunks: list[str],
+    response_format: str,
+    request_started_at: float,
+) -> StreamingResponse:
+    async def events() -> AsyncIterator[str]:
+        synthesis_semaphore: asyncio.Semaphore | None = None
+        completed = 0
+        try:
+            runtime = await _run_blocking(runtime_manager.get)
+            synthesis_semaphore = await _acquire_synthesis_slot()
+            for index, chunk in enumerate(chunks):
+                logger.info(
+                    "speech stream chunk %d/%d started: chars=%d",
+                    index + 1,
+                    len(chunks),
+                    len(chunk),
+                )
+                chunk_request = replace(sampling_request, text=chunk)
+                result = await _run_stream_blocking(
+                    runtime.synthesize,
+                    chunk_request,
+                    log_fn=_log_runtime_message,
+                )
+                audio_bytes = await _run_stream_blocking(
+                    encode_audio,
+                    result.audio,
+                    result.sample_rate,
+                    response_format,
+                )
+                completed += 1
+                logger.info(
+                    "speech stream chunk %d/%d completed: audio_seconds=%.2f bytes=%d",
+                    index + 1,
+                    len(chunks),
+                    _audio_duration_seconds(result.audio, result.sample_rate),
+                    len(audio_bytes),
+                )
+                yield _sse_event(
+                    "audio_chunk",
+                    {
+                        "index": index,
+                        "text": chunk,
+                        "format": response_format,
+                        "media_type": CONTENT_TYPES[response_format],
+                        "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+                        "seed": result.used_seed,
+                        "total_to_decode": result.total_to_decode,
+                    },
+                )
+        except RuntimeLoadTimeoutError as exc:
+            yield _sse_error_event(str(exc), error_type="server_error", code="runtime_unavailable")
+            return
+        except HTTPException as exc:
+            yield _sse_openai_error_event(exc)
+            return
+        except (FileNotFoundError, ValueError) as exc:
+            yield _sse_error_event(str(exc), code="invalid_request")
+            return
+        except RuntimeError as exc:
+            error_type = (
+                "invalid_request_error"
+                if "Dynamic LoRA loading is not compatible" in str(exc)
+                else "server_error"
+            )
+            yield _sse_error_event(str(exc), error_type=error_type, code="stream_error")
+            return
+        else:
+            logger.info(
+                "speech stream completed: elapsed=%.2fs chunks=%d",
+                time.perf_counter() - request_started_at,
+                completed,
+            )
+            yield _sse_event("done", {"chunks": completed})
+        finally:
+            if synthesis_semaphore is not None:
+                _release_synthesis_slot(synthesis_semaphore)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _run_stream_blocking(func: Any, *args: Any, **kwargs: Any) -> Any:
+    task = asyncio.create_task(_run_blocking(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
+def _sse_event(event: str, data: dict[str, Any]) -> str:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+def _sse_error_event(
+    message: str,
+    *,
+    error_type: str = "invalid_request_error",
+    code: str,
+    param: str | None = None,
+) -> str:
+    return _sse_event(
+        "error",
+        {
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": param,
+                "code": code,
+            }
+        },
+    )
+
+
+def _sse_openai_error_event(exc: HTTPException) -> str:
+    error_type = "invalid_request_error" if exc.status_code < 500 else "server_error"
+    code = "synthesis_queue_timeout" if exc.status_code == 503 else "stream_error"
+    return _sse_error_event(str(exc.detail), error_type=error_type, code=code)
 
 
 def _log_runtime_message(message: str) -> None:

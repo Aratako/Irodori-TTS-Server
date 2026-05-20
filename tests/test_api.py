@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import threading
 
 import pytest
@@ -62,6 +64,27 @@ class NeverAvailableSemaphore:
 
     def release(self):
         raise AssertionError("release should not be called when acquire times out")
+
+
+class RecordingSemaphore:
+    def __init__(self) -> None:
+        self.released = False
+
+    async def acquire(self):
+        return True
+
+    def release(self):
+        self.released = True
+
+
+def sse_events(text: str) -> list[tuple[str, dict]]:
+    events = []
+    for block in text.strip().split("\n\n"):
+        lines = block.splitlines()
+        event = next(line.removeprefix("event: ") for line in lines if line.startswith("event: "))
+        data = next(line.removeprefix("data: ") for line in lines if line.startswith("data: "))
+        events.append((event, json.loads(data)))
+    return events
 
 
 def test_health_does_not_load_model(tmp_path, monkeypatch):
@@ -187,7 +210,7 @@ def test_speech_returns_503_when_model_is_loading(monkeypatch):
     assert "Model is still loading" in response.json()["error"]["message"]
 
 
-def test_speech_rejects_sse_stream_format_before_loading_runtime(monkeypatch):
+def test_speech_stream_format_sse_emits_audio_chunk(monkeypatch):
     runtime = FakeRuntime()
     monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
 
@@ -197,11 +220,45 @@ def test_speech_rejects_sse_stream_format_before_loading_runtime(monkeypatch):
             "model": "irodori-tts",
             "input": "こんにちは。",
             "voice": "none",
+            "response_format": "wav",
             "stream_format": "sse",
         },
     )
 
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert runtime.texts == ["こんにちは。"]
+    events = sse_events(response.text)
+    assert [event for event, _data in events] == ["audio_chunk", "done"]
+    audio_chunk = events[0][1]
+    assert audio_chunk["index"] == 0
+    assert audio_chunk["text"] == "こんにちは。"
+    assert audio_chunk["format"] == "wav"
+    assert audio_chunk["media_type"] == "audio/wav"
+    assert audio_chunk["seed"] == 123
+    assert audio_chunk["total_to_decode"] == 0.1
+    assert base64.b64decode(audio_chunk["audio_base64"]).startswith(b"RIFF")
+    assert events[1][1] == {"chunks": 1}
+
+
+def test_speech_rejects_unknown_stream_format_before_loading_runtime(monkeypatch):
+    runtime = FakeRuntime()
+    manager = FakeRuntimeManager(runtime=runtime)
+    monkeypatch.setattr(main, "runtime_manager", manager)
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "こんにちは。",
+            "voice": "none",
+            "stream_format": "jsonl",
+        },
+    )
+
     assert response.status_code == 400
+    assert "stream_format" in response.json()["error"]["message"]
+    assert manager.thread_ids == []
     assert runtime.texts == []
 
 
@@ -472,6 +529,128 @@ def test_speech_returns_503_when_synthesis_queue_times_out(monkeypatch):
     assert runtime.texts == []
 
 
+def test_speech_stream_format_sse_returns_queue_timeout_as_error_event(monkeypatch):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    monkeypatch.setattr(main.settings, "synthesis_wait_timeout", 0.01)
+    monkeypatch.setattr(main.settings, "max_concurrent_synthesis", 1)
+    monkeypatch.setattr(main, "_synthesis_semaphore", NeverAvailableSemaphore())
+    monkeypatch.setattr(main, "_synthesis_semaphore_limit", 1)
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "こんにちは。",
+            "voice": "none",
+            "response_format": "wav",
+            "stream_format": "sse",
+        },
+    )
+
+    assert response.status_code == 200
+    assert sse_events(response.text) == [
+        (
+            "error",
+            {
+                "error": {
+                    "message": "Synthesis queue is full. Retry after a moment. timeout=0.0s",
+                    "type": "server_error",
+                    "param": None,
+                    "code": "synthesis_queue_timeout",
+                }
+            },
+        )
+    ]
+    assert runtime.texts == []
+
+
+def test_speech_stream_format_sse_returns_runtime_error_event(monkeypatch):
+    runtime = FakeRuntime(exc=ValueError("runtime validation failed"))
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "こんにちは。",
+            "voice": "none",
+            "response_format": "wav",
+            "stream_format": "sse",
+        },
+    )
+
+    assert response.status_code == 200
+    assert sse_events(response.text) == [
+        (
+            "error",
+            {
+                "error": {
+                    "message": "runtime validation failed",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "invalid_request",
+                }
+            },
+        )
+    ]
+
+
+def test_speech_stream_format_sse_holds_slot_until_cancelled_synthesis_finishes(monkeypatch):
+    semaphore = RecordingSemaphore()
+
+    async def run_test():
+        started = asyncio.Event()
+        release_synthesis = asyncio.Event()
+        main_thread_loop = asyncio.get_running_loop()
+
+        class SlowRuntime:
+            def synthesize(self, req, *, log_fn=None):
+                main_thread_loop.call_soon_threadsafe(started.set)
+                asyncio.run_coroutine_threadsafe(
+                    release_synthesis.wait(), main_thread_loop
+                ).result()
+                audio = torch.zeros(1, max(1, len(req.text)) * 10)
+                return SamplingResult(
+                    audio=audio,
+                    audios=[audio],
+                    sample_rate=1000,
+                    stage_timings=[],
+                    total_to_decode=0.1,
+                    used_seed=123,
+                    messages=[],
+                )
+
+        monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=SlowRuntime()))
+
+        response = main._stream_speech_response(
+            main.SamplingRequest(text="こんにちは。", no_ref=True),
+            ["こんにちは。"],
+            "wav",
+            0.0,
+        )
+        stream = response.body_iterator
+        task = asyncio.create_task(stream.__anext__())
+
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert semaphore.released is False
+
+        release_synthesis.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert semaphore.released is True
+
+    async def fake_acquire_synthesis_slot():
+        await semaphore.acquire()
+        return semaphore
+
+    monkeypatch.setattr(main, "_acquire_synthesis_slot", fake_acquire_synthesis_slot)
+
+    asyncio.run(run_test())
+
+
 def test_speech_chunking_can_be_disabled_per_request(monkeypatch):
     runtime = FakeRuntime()
     monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
@@ -523,6 +702,39 @@ def test_speech_chunking_splits_only_after_min_chars(monkeypatch):
     assert len(runtime.texts) == 2
     assert runtime.texts[0].endswith("。")
     assert runtime.texts[1] == "最後です。"
+
+
+def test_speech_stream_format_sse_emits_each_chunk(monkeypatch):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    text = (
+        "これは短い文です。これはまだ同じチャンクに残る文です。"
+        "ここまでで十分長くなったので分割されます。最後です。"
+    )
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": text,
+            "voice": "none",
+            "response_format": "wav",
+            "stream_format": "sse",
+            "irodori": {
+                "chunking_enabled": True,
+                "chunk_min_chars": 35,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(runtime.texts) == 2
+    events = sse_events(response.text)
+    assert [event for event, _data in events] == ["audio_chunk", "audio_chunk", "done"]
+    assert [data["text"] for _event, data in events[:2]] == runtime.texts
+    assert events[0][1]["index"] == 0
+    assert events[1][1]["index"] == 1
+    assert events[2][1] == {"chunks": 2}
 
 
 def test_speech_chunking_skips_when_seconds_is_explicit(monkeypatch):

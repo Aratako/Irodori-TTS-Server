@@ -174,9 +174,47 @@ Request fields:
 | `voice` | string or object | no | Voice ID, or `{ "id": "voice_id" }`. Uses `IRODORI_DEFAULT_VOICE` if omitted. |
 | `response_format` | string | no | `wav`, `mp3`, `flac`, `opus`, `aac`, or `pcm`. |
 | `speed` | number | no | Speaking speed, from `0.25` to `4.0`. Higher is faster; internally this is converted to an inverse duration scale. |
+| `stream_format` | string | no | Set to `sse` to receive chunk-level Server-Sent Events. |
 | `irodori` | object | no | Irodori-specific inference options. |
 
-`stream_format: "sse"` is rejected because streaming synthesis is not supported.
+When `stream_format: "sse"` is set, the response is `text/event-stream`.
+The server synthesizes each text chunk sequentially and emits one `audio_chunk`
+event per chunk, followed by a final `done` event:
+
+For consistent voice tone across chunks, specify a reference voice with `voice`
+or `irodori.ref_wav`. Without a reference, each chunk is synthesized
+independently and the perceived voice tone may vary between chunks.
+
+```bash
+curl -N http://localhost:8088/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+    "model": "irodori-tts",
+    "input": "最初の文です。次の文です。",
+    "voice": "sample",
+    "response_format": "wav",
+    "stream_format": "sse",
+    "irodori": {
+      "chunking_enabled": true,
+      "chunk_min_chars": 1
+    }
+  }'
+```
+
+```text
+event: audio_chunk
+data: {"index":0,"text":"最初の文です。","format":"wav","media_type":"audio/wav","audio_base64":"...","seed":123,"total_to_decode":0.1}
+
+event: audio_chunk
+data: {"index":1,"text":"次の文です。","format":"wav","media_type":"audio/wav","audio_base64":"...","seed":123,"total_to_decode":0.1}
+
+event: done
+data: {"chunks":2}
+```
+
+Each `audio_base64` value contains a complete audio file for that chunk, so
+clients can decode and enqueue chunks while later chunks are still generating.
 
 Irodori-specific options:
 
