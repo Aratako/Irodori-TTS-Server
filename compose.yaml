@@ -1,6 +1,9 @@
 services:
   api:
-    build: .
+    build:
+      context: .
+      args:
+        IRODORI_TTS_BACKEND: ${IRODORI_TTS_BACKEND:-cu128}
     image: irodori-openai-tts:local
     command: ["/app/.venv/bin/python", "-m", "irodori_openai_tts"]
     env_file:

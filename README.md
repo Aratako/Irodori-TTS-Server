@@ -27,17 +27,28 @@ For Docker:
 
 - Docker Engine with Docker Compose, or Docker Desktop
 - NVIDIA Container Toolkit or Docker Desktop GPU support for CUDA inference
+- ROCm-capable Docker host for AMD GPU inference
 
-An NVIDIA GPU is recommended for practical inference.
+A CUDA or ROCm GPU is recommended for practical inference.
 
 ## Installation
 
 ```bash
 git clone https://github.com/Aratako/Irodori-TTS-Server.git
 cd Irodori-TTS-Server
-uv sync
+uv sync --extra cu128
 cp .env.example .env
 ```
+
+Choose one PyTorch backend extra:
+
+```bash
+uv sync --extra cu128  # NVIDIA CUDA 12.8
+uv sync --extra rocm   # AMD ROCm on Linux
+uv sync --extra cpu    # CPU-only
+```
+
+The PyTorch backend extras are mutually exclusive. The `cu128` extra uses the PyTorch CUDA 12.8 index, the `rocm` extra uses the PyTorch ROCm index on Linux, and the `cpu` extra uses the CPU PyTorch index on Linux/Windows.
 
 By default, the server downloads [`Aratako/Irodori-TTS-500M-v3`](https://huggingface.co/Aratako/Irodori-TTS-500M-v3) from Hugging Face when the model is first loaded. To use a local checkpoint, set:
 
@@ -65,6 +76,14 @@ Create `.env` first:
 cp .env.example .env
 ```
 
+Set the backend used when the image is built:
+
+```env
+IRODORI_TTS_BACKEND=cu128
+```
+
+Supported values are `cu128`, `rocm`, and `cpu`.
+
 On the first run, or after updating the server code, build and recreate the container:
 
 ```bash
@@ -88,6 +107,20 @@ Then use this for normal GPU startup:
 ```bash
 docker compose -f compose.yaml -f compose.gpu.yaml up
 ```
+
+For AMD ROCm, set `IRODORI_TTS_BACKEND=rocm` in `.env`, then build and recreate with the ROCm Compose file:
+
+```bash
+docker compose -f compose.yaml -f compose.rocm.yaml up --build --force-recreate
+```
+
+Then use this for normal ROCm startup:
+
+```bash
+docker compose -f compose.yaml -f compose.rocm.yaml up
+```
+
+For CPU-only Docker images, set `IRODORI_TTS_BACKEND=cpu` in `.env` before building.
 
 Reference voices placed in `./voices` are available inside the container. Downloaded Hugging Face files are kept in a Docker volume so they are reused across container recreations.
 
@@ -325,6 +358,7 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 | --- | --- | --- |
 | `IRODORI_HOST` | `0.0.0.0` | Server host. |
 | `IRODORI_PORT` | `8088` | Server port. |
+| `IRODORI_TTS_BACKEND` | `cu128` | Docker build backend: `cu128`, `rocm`, or `cpu`. |
 | `IRODORI_API_KEY` | unset | Optional bearer token. |
 | `IRODORI_MODEL_NAME` | `irodori-tts` | Model ID used in requests. |
 | `IRODORI_HF_CHECKPOINT` | `Aratako/Irodori-TTS-500M-v3` | Hugging Face repo containing `model.safetensors`. |
@@ -356,22 +390,24 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 
 ## Development
 
+Include the backend extra you use locally when running development commands. The examples below use `cu128`; replace it with `rocm` or `cpu` as needed.
+
 Run tests:
 
 ```bash
-uv run --extra dev pytest
+uv run --extra cu128 --extra dev pytest
 ```
 
 Run lint:
 
 ```bash
-uv run ruff check src tests
+uv run --extra cu128 --extra dev ruff check src tests
 ```
 
 Run import/bytecode checks:
 
 ```bash
-uv run python -m compileall src tests
+uv run --extra cu128 python -m compileall src tests
 ```
 
 ## License

@@ -1,0 +1,15 @@
+services:
+  api:
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+    ipc: host
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      IRODORI_MODEL_DEVICE: cuda
+      IRODORI_CODEC_DEVICE: cuda
+      IRODORI_MODEL_PRECISION: bf16
+      IRODORI_CODEC_PRECISION: bf16
