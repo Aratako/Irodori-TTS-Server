@@ -62,6 +62,12 @@ IRODORI_CHECKPOINT=/path/to/model.safetensors
 uv run python -m irodori_openai_tts --host 0.0.0.0 --port 8088
 ```
 
+For ROCm:
+
+```bash
+uv run --extra rocm python -m irodori_openai_tts --host 0.0.0.0 --port 8088
+```
+
 Open the health endpoint:
 
 ```bash
@@ -390,24 +396,22 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 
 ## Development
 
-Include the backend extra you use locally when running development commands. The examples below use `cu128`; replace it with `rocm` or `cpu` as needed.
-
 Run tests:
 
 ```bash
-uv run --extra cu128 --extra dev pytest
+uv run --extra dev pytest
 ```
 
 Run lint:
 
 ```bash
-uv run --extra cu128 --extra dev ruff check src tests
+uv run --extra dev ruff check src tests
 ```
 
 Run import/bytecode checks:
 
 ```bash
-uv run --extra cu128 python -m compileall src tests
+uv run python -m compileall src tests
 ```
 
 ## License
