@@ -578,11 +578,9 @@ def _stream_speech_response(
     request_started_at: float,
 ) -> StreamingResponse:
     async def events() -> AsyncIterator[str]:
-        synthesis_semaphore: asyncio.Semaphore | None = None
         completed = 0
         try:
             runtime = await _run_blocking(runtime_manager.get)
-            synthesis_semaphore = await _acquire_synthesis_slot()
             for index, chunk in enumerate(chunks):
                 logger.info(
                     "speech stream chunk %d/%d started: chars=%d",
@@ -591,11 +589,15 @@ def _stream_speech_response(
                     len(chunk),
                 )
                 chunk_request = replace(sampling_request, text=chunk)
-                result = await _run_stream_blocking(
-                    runtime.synthesize,
-                    chunk_request,
-                    log_fn=_log_runtime_message,
-                )
+                synthesis_semaphore = await _acquire_synthesis_slot()
+                try:
+                    result = await _run_stream_blocking(
+                        runtime.synthesize,
+                        chunk_request,
+                        log_fn=_log_runtime_message,
+                    )
+                finally:
+                    _release_synthesis_slot(synthesis_semaphore)
                 audio_bytes = await _run_stream_blocking(
                     encode_audio,
                     result.audio,
@@ -646,9 +648,6 @@ def _stream_speech_response(
                 completed,
             )
             yield _sse_event("done", {"chunks": completed})
-        finally:
-            if synthesis_semaphore is not None:
-                _release_synthesis_slot(synthesis_semaphore)
 
     return StreamingResponse(
         events(),

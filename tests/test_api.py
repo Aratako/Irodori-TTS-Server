@@ -596,6 +596,31 @@ def test_speech_stream_format_sse_returns_runtime_error_event(monkeypatch):
     ]
 
 
+def test_speech_stream_format_sse_releases_slot_before_yielding_chunk(monkeypatch):
+    semaphore = RecordingSemaphore()
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+
+    async def fake_acquire_synthesis_slot():
+        await semaphore.acquire()
+        return semaphore
+
+    monkeypatch.setattr(main, "_acquire_synthesis_slot", fake_acquire_synthesis_slot)
+
+    async def run_test():
+        response = main._stream_speech_response(
+            main.SamplingRequest(text="こんにちは。", no_ref=True),
+            ["こんにちは。"],
+            "wav",
+            0.0,
+        )
+        chunk = await response.body_iterator.__anext__()
+        assert chunk.startswith("event: audio_chunk\n")
+        assert semaphore.released is True
+
+    asyncio.run(run_test())
+
+
 def test_speech_stream_format_sse_holds_slot_until_cancelled_synthesis_finishes(monkeypatch):
     semaphore = RecordingSemaphore()
 
