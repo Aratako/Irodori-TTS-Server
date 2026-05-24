@@ -363,7 +363,10 @@ def test_speech_rejects_invalid_duration_range_before_loading_runtime(monkeypatc
     assert runtime.texts == []
 
 
-@pytest.mark.parametrize("field", ["duration_scale", "chunk_min_chars", "ref_normalize_db"])
+@pytest.mark.parametrize(
+    "field",
+    ["duration_scale", "chunk_min_chars", "first_sentence_chunk_min_chars", "ref_normalize_db"],
+)
 def test_speech_rejects_invalid_top_level_numeric_extra_before_loading_runtime(
     monkeypatch,
     field,
@@ -729,6 +732,55 @@ def test_speech_chunking_splits_only_after_min_chars(monkeypatch):
     assert runtime.texts[1] == "最後です。"
 
 
+def test_speech_chunking_uses_first_sentence_min_chars_only_for_first_split(monkeypatch):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "最初は速く、すぐ返します。次は長くて、通常のままです。",
+            "voice": "none",
+            "response_format": "wav",
+            "irodori": {
+                "chunking_enabled": True,
+                "chunk_min_chars": 80,
+                "first_sentence_chunk_min_chars": 1,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert runtime.texts == [
+        "最初は速く、",
+        "すぐ返します。次は長くて、通常のままです。",
+    ]
+
+
+def test_speech_chunking_does_not_split_shorter_first_sentence(monkeypatch):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "短い。これは続きです。",
+            "voice": "none",
+            "response_format": "wav",
+            "irodori": {
+                "chunking_enabled": True,
+                "chunk_min_chars": 80,
+                "first_sentence_chunk_min_chars": 10,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert runtime.texts == ["短い。これは続きです。"]
+
+
 def test_speech_stream_format_sse_emits_each_chunk(monkeypatch):
     runtime = FakeRuntime()
     monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
@@ -809,6 +861,30 @@ def test_speech_rejects_invalid_chunk_min_chars(monkeypatch):
 
     assert response.status_code == 400
     assert "chunk_min_chars" in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_speech_rejects_invalid_first_sentence_chunk_min_chars(monkeypatch, value):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "こんにちは。",
+            "voice": "none",
+            "response_format": "wav",
+            "irodori": {
+                "chunking_enabled": True,
+                "first_sentence_chunk_min_chars": value,
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert "first_sentence_chunk_min_chars" in response.json()["error"]["message"]
+    assert runtime.texts == []
 
 
 def test_openai_speed_maps_to_inverse_duration_scale():

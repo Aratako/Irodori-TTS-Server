@@ -71,6 +71,7 @@ class IrodoriOptions(BaseModel):
     lora_adapter: str | None = None
     chunking_enabled: bool | None = None
     chunk_min_chars: int | None = None
+    first_sentence_chunk_min_chars: int | None = None
 
 
 class SpeechRequest(BaseModel):
@@ -492,22 +493,58 @@ def _speech_chunks(payload: SpeechRequest, sampling_request: SamplingRequest) ->
     if min_chars <= 0:
         raise HTTPException(status_code=400, detail="chunk_min_chars must be greater than 0.")
 
-    chunks = _split_text_for_speech(payload.input, min_chars=min_chars)
+    first_sentence_min_chars = _as_optional_int(
+        _coalesce(
+            payload.irodori.first_sentence_chunk_min_chars,
+            _extra(payload, "first_sentence_chunk_min_chars"),
+        ),
+        "first_sentence_chunk_min_chars",
+    )
+    if first_sentence_min_chars is not None and first_sentence_min_chars <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="first_sentence_chunk_min_chars must be greater than 0.",
+        )
+
+    chunks = _split_text_for_speech(
+        payload.input,
+        min_chars=min_chars,
+        first_sentence_min_chars=first_sentence_min_chars,
+    )
     if len(chunks) > 1:
-        logger.info("speech chunking enabled: chunks=%d min_chars=%d", len(chunks), min_chars)
+        logger.info(
+            "speech chunking enabled: chunks=%d min_chars=%d first_sentence_min_chars=%s",
+            len(chunks),
+            min_chars,
+            first_sentence_min_chars,
+        )
     return chunks
 
 
-def _split_text_for_speech(text: str, *, min_chars: int) -> list[str]:
+def _split_text_for_speech(
+    text: str,
+    *,
+    min_chars: int,
+    first_sentence_min_chars: int | None = None,
+) -> list[str]:
     chunks: list[str] = []
     current: list[str] = []
     current_chars = 0
+    use_first_sentence_min = first_sentence_min_chars is not None
 
     for char in text:
         current.append(char)
         if not char.isspace():
             current_chars += 1
-        if char in CHUNK_BOUNDARIES and current_chars >= min_chars:
+        if char not in CHUNK_BOUNDARIES:
+            continue
+
+        current_min_chars = min_chars
+        if use_first_sentence_min:
+            use_first_sentence_min = False
+            current_min_chars = first_sentence_min_chars
+
+        if current_chars >= current_min_chars:
             chunk = "".join(current).strip()
             if chunk:
                 chunks.append(chunk)

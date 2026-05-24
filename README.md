@@ -289,6 +289,7 @@ Common `irodori` options:
 | `sway_coeff` | Sway schedule coefficient when using `t_schedule_mode: "sway"`. |
 | `chunking_enabled` | Enable or disable automatic long text chunking for this request. |
 | `chunk_min_chars` | Minimum non-space characters before a chunk split point is used. |
+| `first_sentence_chunk_min_chars` | Optional minimum non-space characters used only for splitting the first sentence. |
 
 Dynamic LoRA loading is per runtime process. The first request for an adapter loads it into memory; later requests for the same adapter reuse the cached adapter. To run the base model after an adapter has been loaded, omit `lora_adapter` or set it to `null`, `"none"`, or `"base"`. Dynamic LoRA is not compatible with `IRODORI_COMPILE_MODEL=true`.
 
@@ -360,6 +361,10 @@ When enabled, the server splits text only when both conditions are met:
 - the current chunk has at least `chunk_min_chars` non-space characters
 - the current character is punctuation or a line break
 
+Set `irodori.first_sentence_chunk_min_chars` to use a smaller threshold only
+for the first sentence. Later sentences keep the normal `chunk_min_chars`
+threshold.
+
 Each chunk is synthesized sequentially, then concatenated into one audio response.
 
 Per-request override:
@@ -372,7 +377,8 @@ Per-request override:
   "response_format": "wav",
   "irodori": {
     "chunking_enabled": true,
-    "chunk_min_chars": 80
+    "chunk_min_chars": 80,
+    "first_sentence_chunk_min_chars": 1
   }
 }
 ```
