@@ -101,6 +101,7 @@ def test_health_does_not_load_model(tmp_path, monkeypatch):
     assert body["runtime"]["synthesis_wait_timeout"] == 300.0
     assert body["voices"]["dir_exists"] is True
     assert body["defaults"]["chunk_min_chars"] == main.settings.default_chunk_min_chars
+    assert body["defaults"]["first_sentence_chunk_min_chars"] is None
 
 
 def test_models_lists_configured_single_v3_model():
@@ -735,6 +736,7 @@ def test_speech_chunking_splits_only_after_min_chars(monkeypatch):
 def test_speech_chunking_uses_first_sentence_min_chars_only_for_first_split(monkeypatch):
     runtime = FakeRuntime()
     monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    monkeypatch.setattr(main.settings, "default_first_sentence_chunk_min_chars", 10)
 
     response = TestClient(main.app).post(
         "/v1/audio/speech",
@@ -756,6 +758,56 @@ def test_speech_chunking_uses_first_sentence_min_chars_only_for_first_split(monk
         "最初は速く、",
         "すぐ返します。次は長くて、通常のままです。",
     ]
+
+
+def test_speech_chunking_uses_default_first_sentence_min_chars(monkeypatch):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    monkeypatch.setattr(main.settings, "default_first_sentence_chunk_min_chars", 1)
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "最初は速く、すぐ返します。次は長くて、通常のままです。",
+            "voice": "none",
+            "response_format": "wav",
+            "irodori": {
+                "chunking_enabled": True,
+                "chunk_min_chars": 80,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert runtime.texts == [
+        "最初は速く、",
+        "すぐ返します。次は長くて、通常のままです。",
+    ]
+
+
+def test_speech_chunking_explicit_null_disables_default_first_sentence_min_chars(monkeypatch):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    monkeypatch.setattr(main.settings, "default_first_sentence_chunk_min_chars", 1)
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "最初は速く、すぐ返します。次は長くて、通常のままです。",
+            "voice": "none",
+            "response_format": "wav",
+            "irodori": {
+                "chunking_enabled": True,
+                "chunk_min_chars": 80,
+                "first_sentence_chunk_min_chars": None,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert runtime.texts == ["最初は速く、すぐ返します。次は長くて、通常のままです。"]
 
 
 def test_speech_chunking_does_not_split_shorter_first_sentence(monkeypatch):

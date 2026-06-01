@@ -186,6 +186,7 @@ def health() -> dict[str, Any]:
             "response_format": settings.default_response_format,
             "chunking_enabled": settings.default_chunking_enabled,
             "chunk_min_chars": settings.default_chunk_min_chars,
+            "first_sentence_chunk_min_chars": settings.default_first_sentence_chunk_min_chars,
         },
     }
 
@@ -494,9 +495,10 @@ def _speech_chunks(payload: SpeechRequest, sampling_request: SamplingRequest) ->
         raise HTTPException(status_code=400, detail="chunk_min_chars must be greater than 0.")
 
     first_sentence_min_chars = _as_optional_int(
-        _coalesce(
-            payload.irodori.first_sentence_chunk_min_chars,
-            _extra(payload, "first_sentence_chunk_min_chars"),
+        _explicit_option(
+            payload,
+            "first_sentence_chunk_min_chars",
+            settings.default_first_sentence_chunk_min_chars,
         ),
         "first_sentence_chunk_min_chars",
     )

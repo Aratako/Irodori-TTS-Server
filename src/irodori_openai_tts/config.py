@@ -66,6 +66,7 @@ class Settings(BaseSettings):
     default_decode_mode: str = "sequential"
     default_chunking_enabled: bool = True
     default_chunk_min_chars: int = 80
+    default_first_sentence_chunk_min_chars: int | None = None
 
     cors_origins: list[str] = Field(default_factory=list)
 
