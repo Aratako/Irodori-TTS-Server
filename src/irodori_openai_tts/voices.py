@@ -19,6 +19,7 @@ VOICE_EXTENSIONS = {
     ".webm",
 }
 LATENT_EXTENSIONS = {".pt", ".pth"}
+SPEAKER_INVERSION_SUFFIX = ".speaker.safetensors"
 NO_REF_IDS = {"none", "no_ref", "no-ref", "null", "text-only"}
 VOICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -28,6 +29,7 @@ class VoiceSpec:
     voice_id: str
     ref_wav: str | None = None
     ref_latent: str | None = None
+    ref_embed: str | None = None
     no_ref: bool = False
 
 
@@ -171,11 +173,16 @@ class VoiceRegistry:
         for path in sorted(root.iterdir()):
             if not path.is_file():
                 continue
-            suffix = path.suffix.lower()
-            if suffix in VOICE_EXTENSIONS:
-                out[path.stem] = VoiceSpec(voice_id=path.stem, ref_wav=str(path))
-            elif suffix in LATENT_EXTENSIONS:
-                out[path.stem] = VoiceSpec(voice_id=path.stem, ref_latent=str(path))
+            name_lower = path.name.lower()
+            if name_lower.endswith(SPEAKER_INVERSION_SUFFIX):
+                voice_id = path.name[: -len(SPEAKER_INVERSION_SUFFIX)]
+                out[voice_id] = VoiceSpec(voice_id=voice_id, ref_embed=str(path))
+            else:
+                suffix = path.suffix.lower()
+                if suffix in VOICE_EXTENSIONS:
+                    out[path.stem] = VoiceSpec(voice_id=path.stem, ref_wav=str(path))
+                elif suffix in LATENT_EXTENSIONS:
+                    out[path.stem] = VoiceSpec(voice_id=path.stem, ref_latent=str(path))
         return out
 
     def _load_aliases(self) -> dict[str, VoiceSpec]:
@@ -201,6 +208,8 @@ class VoiceRegistry:
     def _parse_alias(self, voice_id: str, raw_spec: Any) -> VoiceSpec:
         if isinstance(raw_spec, str):
             path = self._resolve_voice_path(raw_spec)
+            if path.name.lower().endswith(SPEAKER_INVERSION_SUFFIX):
+                return VoiceSpec(voice_id=voice_id, ref_embed=str(path))
             if path.suffix.lower() in LATENT_EXTENSIONS:
                 return VoiceSpec(voice_id=voice_id, ref_latent=str(path))
             return VoiceSpec(voice_id=voice_id, ref_wav=str(path))
@@ -211,12 +220,16 @@ class VoiceRegistry:
         no_ref = bool(raw_spec.get("no_ref", False))
         ref_wav = raw_spec.get("ref_wav")
         ref_latent = raw_spec.get("ref_latent")
+        ref_embed = raw_spec.get("ref_embed")
         return VoiceSpec(
             voice_id=voice_id,
             ref_wav=None if ref_wav is None else str(self._resolve_voice_path(str(ref_wav))),
             ref_latent=None
             if ref_latent is None
             else str(self._resolve_voice_path(str(ref_latent))),
+            ref_embed=None
+            if ref_embed is None
+            else str(self._resolve_voice_path(str(ref_embed))),
             no_ref=no_ref,
         )
 

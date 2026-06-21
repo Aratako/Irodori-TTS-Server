@@ -36,6 +36,7 @@ class IrodoriOptions(BaseModel):
 
     ref_wav: str | None = None
     ref_latent: str | None = None
+    ref_embed: str | None = None
     no_ref: bool | None = None
     seconds: float | None = None
     duration_scale: float | None = None
@@ -216,6 +217,7 @@ def list_voices() -> dict[str, Any]:
                 "object": "voice",
                 "ref_wav": voice.ref_wav,
                 "ref_latent": voice.ref_latent,
+                "ref_embed": voice.ref_embed,
                 "no_ref": voice.no_ref,
             }
         )
@@ -407,19 +409,28 @@ def _resolve_voice(payload: SpeechRequest) -> VoiceSpec:
     options = payload.irodori
     explicit_ref_wav = options.ref_wav
     explicit_ref_latent = options.ref_latent
+    explicit_ref_embed = options.ref_embed
     explicit_no_ref = options.no_ref
     if explicit_ref_wav is None:
         explicit_ref_wav = _extra(payload, "ref_wav")
     if explicit_ref_latent is None:
         explicit_ref_latent = _extra(payload, "ref_latent")
+    if explicit_ref_embed is None:
+        explicit_ref_embed = _extra(payload, "ref_embed")
     if explicit_no_ref is None:
         explicit_no_ref = _extra(payload, "no_ref")
 
-    if explicit_ref_wav is not None or explicit_ref_latent is not None or explicit_no_ref:
+    if (
+        explicit_ref_wav is not None
+        or explicit_ref_latent is not None
+        or explicit_ref_embed is not None
+        or explicit_no_ref
+    ):
         return VoiceSpec(
             voice_id="request",
             ref_wav=None if explicit_ref_wav is None else str(explicit_ref_wav),
             ref_latent=None if explicit_ref_latent is None else str(explicit_ref_latent),
+            ref_embed=None if explicit_ref_embed is None else str(explicit_ref_embed),
             no_ref=bool(explicit_no_ref),
         )
     try:
@@ -771,6 +782,7 @@ def _build_sampling_request(payload: SpeechRequest, voice: VoiceSpec) -> Samplin
         text=payload.input,
         ref_wav=voice.ref_wav,
         ref_latent=voice.ref_latent,
+        ref_embed=voice.ref_embed,
         no_ref=bool(voice.no_ref),
         ref_normalize_db=_as_optional_float(
             _explicit_option(
