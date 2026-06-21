@@ -308,10 +308,11 @@ Supported audio extensions:
 - `.aac`
 - `.webm`
 
-Latent references are also supported:
+Latent references and Speaker Inversion are also supported:
 
 - `.pt`
 - `.pth`
+- `.speaker.safetensors`
 
 Examples:
 
