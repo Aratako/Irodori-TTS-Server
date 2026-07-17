@@ -78,6 +78,12 @@ class RuntimeManager:
     def is_loading(self) -> bool:
         return self._runtime is None and self._lock.locked()
 
+    @property
+    def use_caption_condition(self) -> bool | None:
+        if self._runtime is None:
+            return None
+        return bool(self._runtime.model_cfg.use_caption_condition)
+
     def _resolve_checkpoint_path(self) -> str:
         if self.settings.checkpoint is not None and str(self.settings.checkpoint).strip() != "":
             path = Path(str(self.settings.checkpoint)).expanduser()

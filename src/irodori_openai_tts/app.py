@@ -34,11 +34,12 @@ _synthesis_semaphore_limit: int | None = None
 class IrodoriOptions(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    caption: str | None = None
     ref_wav: str | None = None
     ref_latent: str | None = None
-    ref_embed: str | None = None
     no_ref: bool | None = None
+    text: str | None = None
+    max_caption_len: int | None = None
+    caption_scale: float | None = None
     seconds: float | None = None
     duration_scale: float | None = None
     min_seconds: float | None = None
@@ -51,9 +52,8 @@ class IrodoriOptions(BaseModel):
     sway_coeff: float | None = None
     num_candidates: int | None = None
     decode_mode: Literal["sequential", "batch"] | None = None
-    cfg_scale_text: float | None = None
-    cfg_scale_caption: float | None = None
-    cfg_scale_speaker: float | None = None
+    text_scale: float | None = None
+    speaker_scale: float | None = None
     cfg_guidance_mode: Literal["independent", "joint", "alternating"] | None = None
     cfg_scale: float | None = None
     cfg_min_t: float | None = None
@@ -71,7 +71,6 @@ class IrodoriOptions(BaseModel):
     tail_std_threshold: float | None = None
     tail_mean_threshold: float | None = None
     max_text_len: int | None = None
-    max_caption_len: int | None = None
     lora_adapter: str | None = None
     chunking_enabled: bool | None = None
     chunk_min_chars: int | None = None
@@ -91,6 +90,7 @@ class SpeechRequest(BaseModel):
 
 
 settings = get_settings()
+print(settings)
 runtime_manager = RuntimeManager(settings)
 voice_registry = VoiceRegistry(settings)
 
@@ -180,6 +180,7 @@ def health() -> dict[str, Any]:
             "load_timeout": settings.model_load_timeout,
             "max_concurrent_synthesis": settings.max_concurrent_synthesis,
             "synthesis_wait_timeout": settings.synthesis_wait_timeout,
+            "use_caption_condition": runtime_manager.use_caption_condition,
         },
         "voices": {
             "dir": str(voices_dir),
@@ -220,7 +221,6 @@ def list_voices() -> dict[str, Any]:
                 "object": "voice",
                 "ref_wav": voice.ref_wav,
                 "ref_latent": voice.ref_latent,
-                "ref_embed": voice.ref_embed,
                 "no_ref": voice.no_ref,
             }
         )
@@ -412,28 +412,19 @@ def _resolve_voice(payload: SpeechRequest) -> VoiceSpec:
     options = payload.irodori
     explicit_ref_wav = options.ref_wav
     explicit_ref_latent = options.ref_latent
-    explicit_ref_embed = options.ref_embed
     explicit_no_ref = options.no_ref
     if explicit_ref_wav is None:
         explicit_ref_wav = _extra(payload, "ref_wav")
     if explicit_ref_latent is None:
         explicit_ref_latent = _extra(payload, "ref_latent")
-    if explicit_ref_embed is None:
-        explicit_ref_embed = _extra(payload, "ref_embed")
     if explicit_no_ref is None:
         explicit_no_ref = _extra(payload, "no_ref")
 
-    if (
-        explicit_ref_wav is not None
-        or explicit_ref_latent is not None
-        or explicit_ref_embed is not None
-        or explicit_no_ref
-    ):
+    if explicit_ref_wav is not None or explicit_ref_latent is not None or explicit_no_ref:
         return VoiceSpec(
             voice_id="request",
             ref_wav=None if explicit_ref_wav is None else str(explicit_ref_wav),
             ref_latent=None if explicit_ref_latent is None else str(explicit_ref_latent),
-            ref_embed=None if explicit_ref_embed is None else str(explicit_ref_embed),
             no_ref=bool(explicit_no_ref),
         )
     try:
@@ -781,15 +772,16 @@ def _build_sampling_request(payload: SpeechRequest, voice: VoiceSpec) -> Samplin
     if seconds is not None and payload.speed != 1.0:
         seconds = _as_float(seconds, "seconds") / float(payload.speed)
 
+    caption = _as_optional_str(
+        _coalesce(opts.text, _extra(payload, "caption"), None),
+        "caption",
+    )
+
     return SamplingRequest(
         text=payload.input,
-        caption=_as_optional_str(
-            _coalesce(opts.caption, _extra(payload, "caption"), None),
-            "caption",
-        ),
+        caption=caption,
         ref_wav=voice.ref_wav,
         ref_latent=voice.ref_latent,
-        ref_embed=voice.ref_embed,
         no_ref=bool(voice.no_ref),
         ref_normalize_db=_as_optional_float(
             _explicit_option(
@@ -846,7 +838,11 @@ def _build_sampling_request(payload: SpeechRequest, voice: VoiceSpec) -> Samplin
             "max_text_len",
         ),
         max_caption_len=_as_optional_int(
-            _coalesce(opts.max_caption_len, _extra(payload, "max_caption_len"), None),
+            _coalesce(
+                opts.max_caption_len,
+                _extra(payload, "max_caption_len"),
+                settings.default_max_caption_len,
+            ),
             "max_caption_len",
         ),
         num_steps=_as_int(
@@ -855,27 +851,27 @@ def _build_sampling_request(payload: SpeechRequest, voice: VoiceSpec) -> Samplin
         ),
         cfg_scale_text=_as_float(
             _coalesce(
-                opts.cfg_scale_text,
-                _extra(payload, "cfg_scale_text"),
-                settings.default_cfg_scale_text,
+                opts.text_scale,
+                _extra(payload, "text_scale"),
+                settings.default_text_scale,
             ),
-            "cfg_scale_text",
+            "text_scale",
         ),
         cfg_scale_caption=_as_float(
             _coalesce(
-                opts.cfg_scale_caption,
-                _extra(payload, "cfg_scale_caption"),
-                settings.default_cfg_scale_text,
+                opts.caption_scale,
+                _extra(payload, "caption_scale"),
+                settings.default_caption_scale,
             ),
-            "cfg_scale_caption",
+            "caption_scale",
         ),
         cfg_scale_speaker=_as_float(
             _coalesce(
-                opts.cfg_scale_speaker,
-                _extra(payload, "cfg_scale_speaker"),
-                settings.default_cfg_scale_speaker,
+                opts.speaker_scale,
+                _extra(payload, "speaker_scale"),
+                settings.default_speaker_scale,
             ),
-            "cfg_scale_speaker",
+            "speaker_scale",
         ),
         cfg_guidance_mode=str(
             _coalesce(
