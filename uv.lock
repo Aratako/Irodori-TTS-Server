@@ -1868,7 +1868,9 @@ cu128 = [
 dev = [
     { name = "httpx" },
     { name = "pytest" },
+    { name = "requests" },
     { name = "ruff" },
+    { name = "tqdm" },
 ]
 rocm = [
     { name = "pytorch-triton-rocm", marker = "sys_platform == 'linux'" },
@@ -1890,6 +1892,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "pytorch-triton-rocm", marker = "sys_platform == 'linux' and extra == 'rocm'", specifier = ">=3.5.1", index = "https://download.pytorch.org/whl/rocm7.1", conflict = { package = "irodori-tts-server", extra = "rocm" } },
+    { name = "requests", marker = "extra == 'dev'", specifier = ">=2.32.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9.0" },
     { name = "soundfile", specifier = ">=0.13.1" },
     { name = "torch", specifier = ">=2.10.0,<2.11.0" },
@@ -1906,6 +1909,7 @@ requires-dist = [
     { name = "torchaudio", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'cpu'", specifier = ">=2.10.0,<2.11.0" },
     { name = "torchaudio", marker = "sys_platform != 'linux' and sys_platform != 'win32' and extra == 'cu128'", specifier = ">=2.10.0,<2.11.0" },
     { name = "torchaudio", marker = "sys_platform != 'linux' and extra == 'rocm'", specifier = ">=2.10.0,<2.11.0" },
+    { name = "tqdm", marker = "extra == 'dev'", specifier = ">=4.67.0" },
     { name = "triton-rocm", marker = "sys_platform == 'linux' and extra == 'rocm'", specifier = ">=3.6.0", index = "https://download.pytorch.org/whl/rocm7.1", conflict = { package = "irodori-tts-server", extra = "rocm" } },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
 ]
