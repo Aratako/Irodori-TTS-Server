@@ -26,13 +26,13 @@ class Settings(BaseSettings):
 
     model_device: str = "auto"
     codec_device: str = "auto"
-    model_precision: str = "fp32"
+    model_precision: str = "bf16"
     codec_precision: str = "fp32"
     codec_deterministic_encode: bool = True
     codec_deterministic_decode: bool = True
-    compile_model: bool = False
+    compile_model: bool = True
     compile_dynamic: bool = False
-    preload: bool = False
+    preload: bool = True
     model_load_timeout: float = 300.0
     max_concurrent_synthesis: int = 1
     synthesis_wait_timeout: float = 300.0
@@ -63,7 +63,11 @@ class Settings(BaseSettings):
     default_tail_std_threshold: float = 0.05
     default_tail_mean_threshold: float = 0.1
     default_num_candidates: int = 1
-    default_decode_mode: str = "sequential"
+    default_decode_mode: str = "batch"
+    enable_cpu_fallback_on_oom: bool = True
+    ref_latent_cache_size: int = 8
+    cuda_warmup_enabled: bool = True
+    cuda_warmup_text: str = "こんにちは。これはランタイムウォームアップです。"
     default_chunking_enabled: bool = True
     default_chunk_min_chars: int = 80
     default_first_sentence_chunk_min_chars: int | None = None

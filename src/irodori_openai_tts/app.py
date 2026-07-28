@@ -22,6 +22,7 @@ from irodori_tts.inference_runtime import SamplingRequest, SamplingResult
 
 from .audio import CONTENT_TYPES, encode_audio, normalize_response_format
 from .config import get_settings
+from .ref_cache import RefLatentCache
 from .runtime import RuntimeLoadTimeoutError, RuntimeManager
 from .voices import VoiceRegistry, VoiceSpec
 
@@ -93,6 +94,7 @@ class SpeechRequest(BaseModel):
 settings = get_settings()
 runtime_manager = RuntimeManager(settings)
 voice_registry = VoiceRegistry(settings)
+ref_latent_cache = RefLatentCache(max_entries=settings.ref_latent_cache_size)
 
 
 def startup() -> None:
@@ -346,15 +348,26 @@ async def create_speech(payload: SpeechRequest) -> Response:
         runtime = await _run_blocking(runtime_manager.get)
     except RuntimeLoadTimeoutError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    sampling_request = await _prepare_cached_reference(runtime, sampling_request)
     synthesis_semaphore = await _acquire_synthesis_slot()
     try:
         result = await _synthesize_chunks(runtime, sampling_request, chunks)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except torch.cuda.OutOfMemoryError as exc:
+        result = await _retry_with_cpu_fallback(exc, sampling_request, chunks)
     except RuntimeError as exc:
-        if "Dynamic LoRA loading is not compatible" in str(exc):
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        raise
+        if _is_cuda_oom_runtime_error(exc):
+            result = await _retry_with_cpu_fallback(exc, sampling_request, chunks)
+        elif _is_triton_missing_runtime_error(exc):
+            logger.warning("compile runtime unavailable; retrying with uncompiled runtime: %s", exc)
+            uncompiled_runtime = await _run_blocking(runtime_manager.get_uncompiled_runtime)
+            uncompiled_request = await _prepare_cached_reference(uncompiled_runtime, sampling_request)
+            result = await _synthesize_chunks(uncompiled_runtime, uncompiled_request, chunks)
+        else:
+            if "Dynamic LoRA loading is not compatible" in str(exc):
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise
     finally:
         _release_synthesis_slot(synthesis_semaphore)
     audio_bytes = await _run_blocking(
@@ -644,11 +657,19 @@ def _stream_speech_response(
                 chunk_request = replace(sampling_request, text=chunk)
                 synthesis_semaphore = await _acquire_synthesis_slot()
                 try:
-                    result = await _run_stream_blocking(
-                        runtime.synthesize,
-                        chunk_request,
-                        log_fn=_log_runtime_message,
-                    )
+                    try:
+                        result = await _run_stream_blocking(
+                            runtime.synthesize,
+                            chunk_request,
+                            log_fn=_log_runtime_message,
+                        )
+                    except torch.cuda.OutOfMemoryError as exc:
+                        result = await _retry_with_cpu_fallback(exc, chunk_request, [chunk])
+                    except RuntimeError as exc:
+                        if _is_cuda_oom_runtime_error(exc):
+                            result = await _retry_with_cpu_fallback(exc, chunk_request, [chunk])
+                        else:
+                            raise
                 finally:
                     _release_synthesis_slot(synthesis_semaphore)
                 audio_bytes = await _run_stream_blocking(
@@ -781,7 +802,7 @@ def _build_sampling_request(payload: SpeechRequest, voice: VoiceSpec) -> Samplin
     if seconds is not None and payload.speed != 1.0:
         seconds = _as_float(seconds, "seconds") / float(payload.speed)
 
-    return SamplingRequest(
+    request = SamplingRequest(
         text=payload.input,
         caption=_as_optional_str(
             _coalesce(opts.caption, _extra(payload, "caption"), None),
@@ -975,6 +996,7 @@ def _build_sampling_request(payload: SpeechRequest, voice: VoiceSpec) -> Samplin
             "lora_adapter",
         ),
     )
+    return request
 
 
 def _validate_sampling_request(request: SamplingRequest) -> None:
@@ -1042,6 +1064,48 @@ def _coalesce(*values: Any) -> Any:
         if value is not None:
             return value
     return None
+
+
+def _is_cuda_oom_runtime_error(exc: RuntimeError) -> bool:
+    text = str(exc).lower()
+    return "outofmemory" in text or "out of memory" in text or "cuda error: out of memory" in text
+
+
+def _is_triton_missing_runtime_error(exc: RuntimeError) -> bool:
+    text = str(exc).lower()
+    return "triton" in text and ("cannot find a working triton" in text or "tritonmissing" in text)
+
+
+async def _prepare_cached_reference(
+    runtime: Any,
+    request: SamplingRequest,
+) -> SamplingRequest:
+    try:
+        cached_ref_latent = await _run_blocking(ref_latent_cache.resolve_or_create, runtime, request)
+        if cached_ref_latent is not None:
+            return replace(request, ref_wav=None, ref_latent=cached_ref_latent)
+    except Exception as exc:
+        logger.warning("reference latent cache skipped: %s", exc)
+    return request
+
+
+async def _retry_with_cpu_fallback(
+    source_exc: Exception,
+    sampling_request: SamplingRequest,
+    chunks: list[str],
+) -> SamplingResult:
+    if not bool(settings.enable_cpu_fallback_on_oom):
+        raise HTTPException(status_code=503, detail=f"CUDA OOM: {source_exc}") from source_exc
+    logger.warning("reason=oom fallback=cpu detail=%s", source_exc)
+    try:
+        cpu_runtime = await _run_blocking(runtime_manager.get_cpu_fallback)
+        cpu_request = await _prepare_cached_reference(cpu_runtime, sampling_request)
+        return await _synthesize_chunks(cpu_runtime, cpu_request, chunks)
+    except Exception as fallback_exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"CUDA OOM and CPU fallback failed: {fallback_exc}",
+        ) from fallback_exc
 
 
 def openai_error_response(message: str, *, status_code: int, error_type: str) -> JSONResponse:
