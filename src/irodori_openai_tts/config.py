@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     api_key: str | None = None
 
     checkpoint: str | None = None
-    hf_checkpoint: str = "Aratako/Irodori-TTS-500M-v3"
+    hf_checkpoint: str = "Aratako/Irodori-TTS-v4-Small"
     codec_repo: str = "Aratako/Semantic-DACVAE-Japanese-32dim"
     model_name: str = "irodori-tts"
 
@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     default_cfg_min_t: float = 0.5
     default_cfg_max_t: float = 1.0
     default_context_kv_cache: bool = True
-    default_max_ref_seconds: float | None = 30.0
+    default_max_ref_seconds: float | None = None
     default_ref_normalize_db: float | None = -16.0
     default_ref_ensure_max: bool = True
     default_trim_tail: bool = True

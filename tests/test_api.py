@@ -104,7 +104,7 @@ def test_health_does_not_load_model(tmp_path, monkeypatch):
     assert body["defaults"]["first_sentence_chunk_min_chars"] is None
 
 
-def test_models_lists_configured_single_v3_model():
+def test_models_lists_configured_model():
     response = TestClient(main.app).get("/v1/models")
 
     assert response.status_code == 200
@@ -485,6 +485,80 @@ def test_speech_passes_lora_adapter_option(monkeypatch):
 
     assert response.status_code == 200
     assert runtime.requests[0].lora_adapter == "/models/adapters/speaker-a"
+
+
+@pytest.mark.parametrize(
+    ("field", "paths"),
+    [
+        ("ref_wavs", ["/voices/clip-1.wav", "/voices/clip-2.wav"]),
+        ("ref_latents", ["/voices/clip-1.pt", "/voices/clip-2.pt"]),
+    ],
+)
+def test_speech_passes_multiple_reference_options(monkeypatch, field, paths):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "こんにちは。",
+            "irodori": {field: paths},
+        },
+    )
+
+    assert response.status_code == 200
+    assert getattr(runtime.requests[0], field) == paths
+    assert runtime.requests[0].max_ref_seconds is None
+
+
+@pytest.mark.parametrize("value", [[], [""], "clip.wav"])
+def test_speech_rejects_invalid_multiple_reference_options(monkeypatch, value):
+    runtime = FakeRuntime()
+    manager = FakeRuntimeManager(runtime=runtime)
+    monkeypatch.setattr(main, "runtime_manager", manager)
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "こんにちは。",
+            "ref_wavs": value,
+        },
+    )
+
+    assert response.status_code in {400, 422}
+    assert manager.thread_ids == []
+    assert runtime.requests == []
+
+
+@pytest.mark.parametrize(
+    "irodori",
+    [
+        {"ref_wav": "/voices/one.wav", "ref_wavs": ["/voices/two.wav"]},
+        {"ref_latent": "/voices/one.pt", "ref_latents": ["/voices/two.pt"]},
+        {"ref_wavs": ["/voices/one.wav"], "ref_latents": ["/voices/one.pt"]},
+        {"no_ref": True, "ref_wavs": ["/voices/one.wav"]},
+        {"ref_embed": "/voices/speaker.safetensors", "ref_wavs": ["/voices/one.wav"]},
+    ],
+)
+def test_speech_rejects_conflicting_reference_options_before_loading_runtime(monkeypatch, irodori):
+    runtime = FakeRuntime()
+    manager = FakeRuntimeManager(runtime=runtime)
+    monkeypatch.setattr(main, "runtime_manager", manager)
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "こんにちは。",
+            "irodori": irodori,
+        },
+    )
+
+    assert response.status_code == 400
+    assert manager.thread_ids == []
+    assert runtime.requests == []
 
 
 def test_speech_runs_model_load_and_synthesis_in_executor(monkeypatch):

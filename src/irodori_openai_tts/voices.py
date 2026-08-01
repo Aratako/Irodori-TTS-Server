@@ -28,7 +28,9 @@ VOICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 class VoiceSpec:
     voice_id: str
     ref_wav: str | None = None
+    ref_wavs: tuple[str, ...] | None = None
     ref_latent: str | None = None
+    ref_latents: tuple[str, ...] | None = None
     ref_embed: str | None = None
     no_ref: bool = False
 
@@ -102,11 +104,7 @@ class VoiceRegistry:
     def get_file(self, voice_id: str) -> VoiceFile | None:
         root = self.ensure_dir()
         for path in sorted(root.iterdir()):
-            if (
-                path.is_file()
-                and path.stem == voice_id
-                and path.suffix.lower() in VOICE_EXTENSIONS
-            ):
+            if path.is_file() and path.stem == voice_id and path.suffix.lower() in VOICE_EXTENSIONS:
                 return VoiceFile(voice_id=voice_id, path=path)
         return None
 
@@ -152,7 +150,9 @@ class VoiceRegistry:
     @staticmethod
     def validate_voice_id(voice_id: str) -> None:
         if not voice_id or VOICE_ID_PATTERN.fullmatch(voice_id) is None:
-            raise ValueError("voice_id must contain only ASCII letters, numbers, underscores, or hyphens.")
+            raise ValueError(
+                "voice_id must contain only ASCII letters, numbers, underscores, or hyphens."
+            )
 
     @staticmethod
     def _voice_id_from_request(voice: str | dict[str, Any] | None) -> str | None:
@@ -219,19 +219,33 @@ class VoiceRegistry:
 
         no_ref = bool(raw_spec.get("no_ref", False))
         ref_wav = raw_spec.get("ref_wav")
+        ref_wavs = self._resolve_voice_paths(raw_spec.get("ref_wavs"), field="ref_wavs")
         ref_latent = raw_spec.get("ref_latent")
+        ref_latents = self._resolve_voice_paths(raw_spec.get("ref_latents"), field="ref_latents")
         ref_embed = raw_spec.get("ref_embed")
         return VoiceSpec(
             voice_id=voice_id,
             ref_wav=None if ref_wav is None else str(self._resolve_voice_path(str(ref_wav))),
+            ref_wavs=ref_wavs,
             ref_latent=None
             if ref_latent is None
             else str(self._resolve_voice_path(str(ref_latent))),
-            ref_embed=None
-            if ref_embed is None
-            else str(self._resolve_voice_path(str(ref_embed))),
+            ref_latents=ref_latents,
+            ref_embed=None if ref_embed is None else str(self._resolve_voice_path(str(ref_embed))),
             no_ref=no_ref,
         )
+
+    def _resolve_voice_paths(self, value: Any, *, field: str) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"{field} must be a non-empty array for a voice alias.")
+        paths: list[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(f"{field} entries must be non-empty strings.")
+            paths.append(str(self._resolve_voice_path(item)))
+        return tuple(paths)
 
     def _resolve_voice_path(self, value: str) -> Path:
         raw = Path(value).expanduser()

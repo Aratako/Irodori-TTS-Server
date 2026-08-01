@@ -80,6 +80,47 @@ def test_resolve_alias_file_with_ref_wav(tmp_path):
     assert voice.ref_wav == str(tmp_path / "narrator.wav")
 
 
+def test_resolve_alias_file_with_multiple_references(tmp_path):
+    (tmp_path / "clip-1.wav").write_bytes(b"wav")
+    (tmp_path / "clip-2.wav").write_bytes(b"wav")
+    (tmp_path / "clip-1.pt").write_bytes(b"latent")
+    (tmp_path / "clip-2.pt").write_bytes(b"latent")
+    (tmp_path / "voices.json").write_text(
+        json.dumps(
+            {
+                "audio": {"ref_wavs": ["clip-1.wav", "clip-2.wav"]},
+                "latent": {"ref_latents": ["clip-1.pt", "clip-2.pt"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = make_registry(tmp_path)
+
+    audio = registry.resolve("audio")
+    latent = registry.resolve("latent")
+
+    assert audio.ref_wavs == (
+        str(tmp_path / "clip-1.wav"),
+        str(tmp_path / "clip-2.wav"),
+    )
+    assert latent.ref_latents == (
+        str(tmp_path / "clip-1.pt"),
+        str(tmp_path / "clip-2.pt"),
+    )
+
+
+@pytest.mark.parametrize("value", [[], "clip.wav", [""]])
+def test_resolve_alias_rejects_invalid_multiple_references(tmp_path, value):
+    (tmp_path / "voices.json").write_text(
+        json.dumps({"invalid": {"ref_wavs": value}}),
+        encoding="utf-8",
+    )
+    registry = make_registry(tmp_path)
+
+    with pytest.raises(ValueError, match="ref_wavs"):
+        registry.resolve("invalid")
+
+
 def test_resolve_default_voice(tmp_path):
     (tmp_path / "default.wav").write_bytes(b"wav")
     registry = make_registry(tmp_path, default_voice="default")
@@ -114,7 +155,9 @@ def test_write_file_create_replace_and_delete(tmp_path):
     with pytest.raises(FileExistsError):
         registry.write_file(filename="speaker.wav", data=b"new")
 
-    replaced = registry.write_file(filename="speaker.flac", data=b"new", voice_id="speaker", replace=True)
+    replaced = registry.write_file(
+        filename="speaker.flac", data=b"new", voice_id="speaker", replace=True
+    )
     assert replaced.path.name == "speaker.flac"
     assert not (tmp_path / "speaker.wav").exists()
     assert replaced.path.read_bytes() == b"new"

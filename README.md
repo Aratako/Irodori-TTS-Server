@@ -2,14 +2,16 @@
 
 OpenAI Text-to-Speech API compatible server for [Irodori-TTS](https://github.com/Aratako/Irodori-TTS).
 
-This server targets the [Irodori-TTS 500M v3 base model](https://huggingface.co/Aratako/Irodori-TTS-500M-v3). It supports reference-audio voice cloning, OpenAI-style response formats, and automatic long text chunking.
+This server targets [Irodori-TTS-v4-Small](https://huggingface.co/Aratako/Irodori-TTS-v4-Small). It supports voice cloning, Voice Design, OpenAI-style response formats, and automatic long text chunking.
 
-Streaming synthesis is not implemented. Requests return one complete audio response.
+Standard requests return one complete audio response. Chunk-level Server-Sent Events are also available for long text.
 
 ## Features
 
 - OpenAI-compatible `POST /v1/audio/speech`
-- Reference voices from files, `voices.json`, or HTTP upload
+- Reference voices from files, multiple waveform or latent clips, `voices.json`, or HTTP upload
+- Caption-based Voice Design and Speaker Inversion
+- Up to 120 seconds of combined reference audio with v4 Small
 - Response formats: `wav`, `mp3`, `flac`, `opus`, `aac`, `pcm`
 - Automatic long text chunking
 - Per-request dynamic LoRA adapter loading
@@ -54,11 +56,15 @@ After syncing with a backend extra, use `uv run --no-sync ...` for the commands
 below to avoid re-syncing the environment without the selected PyTorch backend
 extra.
 
-By default, the server downloads [`Aratako/Irodori-TTS-500M-v3`](https://huggingface.co/Aratako/Irodori-TTS-500M-v3) from Hugging Face when the model is first loaded. To use a local checkpoint, set:
+By default, the server downloads [`Aratako/Irodori-TTS-v4-Small`](https://huggingface.co/Aratako/Irodori-TTS-v4-Small) and its bundled tokenizer from Hugging Face when the model is first loaded. To use a local checkpoint, set:
 
 ```bash
 IRODORI_CHECKPOINT=/path/to/model.safetensors
 ```
+
+For v4 checkpoints, keep the exported `tokenizer/` directory next to
+`model.safetensors`. Older checkpoints without bundled tokenizer assets continue
+to use the tokenizer repository recorded in their checkpoint metadata.
 
 ## Running
 
@@ -174,6 +180,51 @@ with client.audio.speech.with_streaming_response.create(
 
 The SDK method name contains `streaming_response`, but this server still generates a complete response internally.
 
+### Voice Design
+
+Irodori-TTS-v4-Small supports both pure Voice Design without reference audio and
+caption-controlled voice cloning.
+
+For pure Voice Design, use the built-in `none` voice and describe the desired
+voice and delivery with `irodori.caption`:
+
+```bash
+curl http://localhost:8088/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "irodori-tts",
+    "input": "本日はお越しいただき、ありがとうございます。",
+    "voice": "none",
+    "response_format": "wav",
+    "irodori": {
+      "caption": "落ち着いた低めの女性の声。丁寧で穏やかな話し方。"
+    }
+  }' \
+  --output voice_design.wav
+```
+
+For caption-controlled voice cloning, specify both a registered reference voice
+and a caption. The reference supplies the speaker identity while the caption
+guides voice characteristics and delivery:
+
+```bash
+curl http://localhost:8088/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "irodori-tts",
+    "input": "それでは、元気よく始めましょう！",
+    "voice": "alice",
+    "response_format": "wav",
+    "irodori": {
+      "caption": "明るく元気で、楽しそうな話し方。"
+    }
+  }' \
+  --output styled_clone.wav
+```
+
+The `none` voice is available when `IRODORI_ALLOW_NO_REF_VOICE=true`, which is
+enabled by default.
+
 ## API
 
 ### `GET /health`
@@ -220,8 +271,8 @@ When `stream_format: "sse"` is set, the response is `text/event-stream`.
 The server synthesizes each text chunk sequentially and emits one `audio_chunk`
 event per chunk, followed by a final `done` event:
 
-For consistent voice tone across chunks, specify a reference voice with `voice`
-or `irodori.ref_wav`. Without a reference, each chunk is synthesized
+For consistent voice tone across chunks, specify a reference voice with `voice`,
+`irodori.ref_wav`, or `irodori.ref_wavs`. Without a reference, each chunk is synthesized
 independently and the perceived voice tone may vary between chunks.
 
 ```bash
@@ -290,6 +341,9 @@ Common `irodori` options:
 | `chunking_enabled` | Enable or disable automatic long text chunking for this request. |
 | `chunk_min_chars` | Minimum non-space characters before a chunk split point is used. |
 | `first_sentence_chunk_min_chars` | Optional minimum non-space characters used only for splitting the first sentence. |
+| `ref_wav` / `ref_latent` | One reference waveform or precomputed latent path. |
+| `ref_wavs` / `ref_latents` | Ordered arrays of reference paths. The runtime concatenates them and applies the reference-duration limit. Do not combine singular and plural reference fields. |
+| `max_ref_seconds` | Override the reference-duration limit. When omitted, v4 Small uses its checkpoint value of 120 seconds and legacy checkpoints fall back to 30 seconds. |
 | `caption` | Voice/style description for caption-enabled VoiceDesign checkpoints. Ignored by checkpoints without caption conditioning. |
 | `cfg_scale_caption` | Strength of caption guidance. |
 | `max_caption_len` | Optional maximum caption token length. |
@@ -326,15 +380,56 @@ voices/
   cached.pt      -> voice: "cached"
 ```
 
-You can also create `voices/voices.json`:
+Each file discovered this way becomes a separate voice. The server does not infer
+that similarly named files belong to the same speaker.
+
+Reference voices can be supplied in four ways:
+
+| Method | Single reference | Multiple references | Lifetime |
+| --- | --- | --- | --- |
+| Place a file in `voices/` | yes | no | Persistent; the filename stem becomes the voice ID. |
+| Voice upload API | yes | no | Persistent; each upload creates or replaces one voice file. |
+| `voices/voices.json` alias | yes | yes | Persistent; use `ref_wavs` or `ref_latents` to group multiple files under one voice ID. |
+| Request-level `irodori.ref_wav` / `irodori.ref_wavs` | yes | yes | One request only; no voice is registered. |
+
+Paths passed directly in a request are resolved on the server, not on the client
+machine. They must be local paths visible to the server process; HTTP URLs are not
+accepted. With Docker, use paths visible inside the container. A remote client
+that cannot provide a server-side path can upload a single reference and use the
+resulting voice ID. Reusable multi-file groups still require a server-side
+`voices.json` definition.
+
+To register multiple clips as one persistent voice, create `voices/voices.json`:
 
 ```json
 {
   "alice": "alice.wav",
   "bob": "bob_reference.flac",
-  "cached": "cached.pt"
+  "cached": "cached.pt",
+  "alice_long": {
+    "ref_wavs": ["alice_01.wav", "alice_02.wav", "alice_03.wav"]
+  }
 }
 ```
+
+Paths in `voices.json` are resolved relative to `IRODORI_VOICES_DIR`. Array entries
+are processed in the order shown. The example above registers the three clips as
+one voice named `alice_long`, which can then be used like any other voice:
+
+```json
+{
+  "model": "irodori-tts",
+  "input": "登録済みの複数参照音声を使用します。",
+  "voice": "alice_long",
+  "response_format": "wav"
+}
+```
+
+The upload API accepts one file at a time and does not append clips to an existing
+voice group. To create a reusable multi-clip voice, place or upload the individual
+files and define their grouping in `voices.json`. For a one-off request that does
+not need registration, pass the paths directly with `irodori.ref_wavs` or
+`irodori.ref_latents` as described below.
 
 Text-only inference is available with `voice: "none"` when `IRODORI_ALLOW_NO_REF_VOICE=true`.
 
@@ -355,6 +450,39 @@ curl http://localhost:8088/v1/audio/voices \
   -F voice_id=sample \
   -F file=@sample.wav
 ```
+
+## Long Reference Audio
+
+Irodori-TTS-v4-Small accepts up to 120 seconds of combined reference audio. Pass
+multiple clips in input order with `irodori.ref_wavs`. These paths refer to files
+visible to the server process, or to the container when running with Docker:
+
+```json
+{
+  "model": "irodori-tts",
+  "input": "複数の参照音声を使った音声合成です。",
+  "irodori": {
+    "ref_wavs": [
+      "voices/speaker_01.wav",
+      "voices/speaker_02.wav",
+      "voices/speaker_03.wav"
+    ]
+  }
+}
+```
+
+The clips are encoded separately, concatenated in the supplied order, and cut at
+the checkpoint-specific reference limit. v4 Small was trained using concatenated
+short clips, so multiple representative clips from the same speaker are the
+recommended way to use the extended context. A single long recording is accepted,
+but its behavior is less established because it does not match the primary
+training construction.
+
+`ref_latents` provides the equivalent ordered input for precomputed latent files.
+Do not mix waveform and latent references, or singular and plural forms in the
+same request. Set `irodori.max_ref_seconds` only when an explicit override is
+needed; omitting it uses checkpoint metadata and preserves the 30-second fallback
+for older checkpoints.
 
 ## Long Text Chunking
 
@@ -415,8 +543,8 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 | `IRODORI_TTS_BACKEND` | `cu128` | Docker build backend: `cu128`, `rocm`, or `cpu`. |
 | `IRODORI_API_KEY` | unset | Optional bearer token. |
 | `IRODORI_MODEL_NAME` | `irodori-tts` | Model ID used in requests. |
-| `IRODORI_HF_CHECKPOINT` | `Aratako/Irodori-TTS-500M-v3` | Hugging Face repo containing `model.safetensors`. |
-| `IRODORI_CHECKPOINT` | unset | Local checkpoint path. Takes precedence over `IRODORI_HF_CHECKPOINT`. |
+| `IRODORI_HF_CHECKPOINT` | `Aratako/Irodori-TTS-v4-Small` | Hugging Face repo containing `model.safetensors` and optional bundled tokenizer assets. |
+| `IRODORI_CHECKPOINT` | unset | Local checkpoint path. Takes precedence over `IRODORI_HF_CHECKPOINT`; keep a bundled `tokenizer/` beside v4 checkpoints. |
 | `IRODORI_CODEC_REPO` | `Aratako/Semantic-DACVAE-Japanese-32dim` | DACVAE codec repo or path. |
 | `IRODORI_MODEL_DEVICE` | `auto` | `auto`, `cuda`, `mps`, or `cpu`. |
 | `IRODORI_CODEC_DEVICE` | `auto` | `auto`, `cuda`, `mps`, or `cpu`. |
@@ -439,6 +567,7 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 | `IRODORI_DEFAULT_CFG_SCALE_TEXT` | `3.0` | Default text CFG scale. |
 | `IRODORI_DEFAULT_CFG_SCALE_SPEAKER` | `5.0` | Default speaker CFG scale. |
 | `IRODORI_DEFAULT_CFG_GUIDANCE_MODE` | `independent` | Default CFG guidance mode. |
+| `IRODORI_DEFAULT_MAX_REF_SECONDS` | unset | Reference-duration override. Unset uses checkpoint metadata; v4 Small uses 120 seconds and legacy checkpoints fall back to 30 seconds. |
 | `IRODORI_DEFAULT_CHUNKING_ENABLED` | `true` | Enable punctuation-aware chunking by default. |
 | `IRODORI_DEFAULT_CHUNK_MIN_CHARS` | `80` | Minimum non-space characters before a split point is used. |
 | `IRODORI_DEFAULT_FIRST_SENTENCE_CHUNK_MIN_CHARS` | unset | Minimum non-space characters before the first sentence split point is used. Unset keeps normal `chunk_min_chars` behavior. |
@@ -469,5 +598,5 @@ This server code is released under the MIT License. See [LICENSE](LICENSE).
 
 Model weights and codec assets are distributed separately. Check the Hugging Face model cards for their licenses and usage terms:
 
-- [Aratako/Irodori-TTS-500M-v3](https://huggingface.co/Aratako/Irodori-TTS-500M-v3)
+- [Aratako/Irodori-TTS-v4-Small](https://huggingface.co/Aratako/Irodori-TTS-v4-Small)
 - [Aratako/Semantic-DACVAE-Japanese-32dim](https://huggingface.co/Aratako/Semantic-DACVAE-Japanese-32dim)

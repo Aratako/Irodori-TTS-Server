@@ -65,7 +65,9 @@ def test_runtime_resolves_local_checkpoint_path(tmp_path):
 
 
 def test_runtime_rejects_missing_local_checkpoint(tmp_path):
-    manager = RuntimeManager(Settings(checkpoint=str(tmp_path / "missing.safetensors"), _env_file=None))
+    manager = RuntimeManager(
+        Settings(checkpoint=str(tmp_path / "missing.safetensors"), _env_file=None)
+    )
 
     with pytest.raises(FileNotFoundError, match="Checkpoint not found"):
         manager._resolve_checkpoint_path()
@@ -74,11 +76,10 @@ def test_runtime_rejects_missing_local_checkpoint(tmp_path):
 def test_runtime_downloads_hf_checkpoint_when_local_checkpoint_is_unset(monkeypatch):
     manager = RuntimeManager(Settings(hf_checkpoint="owner/repo", _env_file=None))
 
-    def fake_download(*, repo_id, filename):
+    def fake_download(repo_id):
         assert repo_id == "owner/repo"
-        assert filename == "model.safetensors"
         return "/cache/model.safetensors"
 
-    monkeypatch.setattr(runtime_module, "hf_hub_download", fake_download)
+    monkeypatch.setattr(runtime_module, "download_hf_checkpoint", fake_download)
 
     assert manager._resolve_checkpoint_path() == "/cache/model.safetensors"

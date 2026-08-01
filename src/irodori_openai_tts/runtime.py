@@ -5,12 +5,11 @@ import threading
 import time
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download
-
 from irodori_tts.inference_runtime import (
     InferenceRuntime,
     RuntimeKey,
     default_runtime_device,
+    download_hf_checkpoint,
 )
 
 from .config import Settings
@@ -88,9 +87,9 @@ class RuntimeManager:
         repo_id = str(self.settings.hf_checkpoint).strip()
         if repo_id == "":
             raise ValueError("Set IRODORI_CHECKPOINT or IRODORI_HF_CHECKPOINT.")
-        logger.info("downloading checkpoint from hf://%s/model.safetensors", repo_id)
+        logger.info("downloading checkpoint assets from hf://%s", repo_id)
         t0 = time.perf_counter()
-        path = hf_hub_download(repo_id=repo_id, filename="model.safetensors")
+        path = download_hf_checkpoint(repo_id)
         elapsed = time.perf_counter() - t0
         logger.info("checkpoint download/cache lookup completed in %.2fs", elapsed)
         return path

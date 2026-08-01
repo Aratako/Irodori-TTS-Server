@@ -36,7 +36,9 @@ class IrodoriOptions(BaseModel):
 
     caption: str | None = None
     ref_wav: str | None = None
+    ref_wavs: list[str] | None = None
     ref_latent: str | None = None
+    ref_latents: list[str] | None = None
     ref_embed: str | None = None
     no_ref: bool | None = None
     seconds: float | None = None
@@ -219,7 +221,9 @@ def list_voices() -> dict[str, Any]:
                 "id": voice.voice_id,
                 "object": "voice",
                 "ref_wav": voice.ref_wav,
+                "ref_wavs": voice.ref_wavs,
                 "ref_latent": voice.ref_latent,
+                "ref_latents": voice.ref_latents,
                 "ref_embed": voice.ref_embed,
                 "no_ref": voice.no_ref,
             }
@@ -411,13 +415,19 @@ def _validate_speech_payload(payload: SpeechRequest) -> None:
 def _resolve_voice(payload: SpeechRequest) -> VoiceSpec:
     options = payload.irodori
     explicit_ref_wav = options.ref_wav
+    explicit_ref_wavs = options.ref_wavs
     explicit_ref_latent = options.ref_latent
+    explicit_ref_latents = options.ref_latents
     explicit_ref_embed = options.ref_embed
     explicit_no_ref = options.no_ref
     if explicit_ref_wav is None:
         explicit_ref_wav = _extra(payload, "ref_wav")
+    if explicit_ref_wavs is None:
+        explicit_ref_wavs = _extra(payload, "ref_wavs")
     if explicit_ref_latent is None:
         explicit_ref_latent = _extra(payload, "ref_latent")
+    if explicit_ref_latents is None:
+        explicit_ref_latents = _extra(payload, "ref_latents")
     if explicit_ref_embed is None:
         explicit_ref_embed = _extra(payload, "ref_embed")
     if explicit_no_ref is None:
@@ -425,14 +435,18 @@ def _resolve_voice(payload: SpeechRequest) -> VoiceSpec:
 
     if (
         explicit_ref_wav is not None
+        or explicit_ref_wavs is not None
         or explicit_ref_latent is not None
+        or explicit_ref_latents is not None
         or explicit_ref_embed is not None
         or explicit_no_ref
     ):
         return VoiceSpec(
             voice_id="request",
             ref_wav=None if explicit_ref_wav is None else str(explicit_ref_wav),
+            ref_wavs=_as_reference_paths(explicit_ref_wavs, "ref_wavs"),
             ref_latent=None if explicit_ref_latent is None else str(explicit_ref_latent),
+            ref_latents=_as_reference_paths(explicit_ref_latents, "ref_latents"),
             ref_embed=None if explicit_ref_embed is None else str(explicit_ref_embed),
             no_ref=bool(explicit_no_ref),
         )
@@ -788,7 +802,9 @@ def _build_sampling_request(payload: SpeechRequest, voice: VoiceSpec) -> Samplin
             "caption",
         ),
         ref_wav=voice.ref_wav,
+        ref_wavs=None if voice.ref_wavs is None else list(voice.ref_wavs),
         ref_latent=voice.ref_latent,
+        ref_latents=None if voice.ref_latents is None else list(voice.ref_latents),
         ref_embed=voice.ref_embed,
         no_ref=bool(voice.no_ref),
         ref_normalize_db=_as_optional_float(
@@ -984,6 +1000,31 @@ def _validate_sampling_request(request: SamplingRequest) -> None:
         raise HTTPException(
             status_code=400, detail="max_seconds must be greater than or equal to min_seconds."
         )
+    if request.ref_wav is not None and request.ref_wavs:
+        raise HTTPException(status_code=400, detail="ref_wav and ref_wavs cannot be combined.")
+    if request.ref_latent is not None and request.ref_latents:
+        raise HTTPException(
+            status_code=400,
+            detail="ref_latent and ref_latents cannot be combined.",
+        )
+    has_wav = request.ref_wav is not None or bool(request.ref_wavs)
+    has_latent = request.ref_latent is not None or bool(request.ref_latents)
+    if has_wav and has_latent:
+        raise HTTPException(
+            status_code=400,
+            detail="Waveform and latent references cannot be combined.",
+        )
+    has_reference = has_wav or has_latent or request.ref_embed is not None
+    if request.no_ref and has_reference:
+        raise HTTPException(
+            status_code=400,
+            detail="no_ref cannot be combined with a reference input.",
+        )
+    if request.ref_embed is not None and (has_wav or has_latent):
+        raise HTTPException(
+            status_code=400,
+            detail="ref_embed cannot be combined with waveform or latent references.",
+        )
 
 
 def _extra(payload: SpeechRequest, key: str) -> Any:
@@ -1035,6 +1076,22 @@ def _as_optional_str(value: Any, name: str) -> str | None:
     if text == "":
         raise ValueError(f"{name} must be non-empty when specified.")
     return text
+
+
+def _as_reference_paths(value: Any, name: str) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or not value:
+        raise HTTPException(status_code=400, detail=f"{name} must be a non-empty array.")
+    paths: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} entries must be non-empty strings.",
+            )
+        paths.append(item.strip())
+    return tuple(paths)
 
 
 def _coalesce(*values: Any) -> Any:

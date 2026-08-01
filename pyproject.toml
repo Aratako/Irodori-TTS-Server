@@ -7,7 +7,7 @@ license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115.0",
-    "huggingface-hub>=0.34.0,<1.0",
+    "huggingface-hub>=0.34.0",
     "irodori-tts @ git+https://github.com/Aratako/Irodori-TTS.git",
     "pydantic-settings>=2.6.0",
     "python-dotenv>=1.0.1",
