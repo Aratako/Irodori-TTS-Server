@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import threading
 import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -29,6 +30,8 @@ logger = logging.getLogger(__name__)
 CHUNK_BOUNDARIES = frozenset("。、，,．.!！?？\n\r")
 _synthesis_semaphore: asyncio.Semaphore | None = None
 _synthesis_semaphore_limit: int | None = None
+_empty_cache_lock = threading.Lock()
+_synthesis_since_empty_cache = 0
 
 
 class IrodoriOptions(BaseModel):
@@ -468,6 +471,55 @@ async def _run_blocking(func: Any, *args: Any, **kwargs: Any) -> Any:
     return await loop.run_in_executor(None, partial(func, *args, **kwargs))
 
 
+def _synthesize_once(runtime: Any, request: SamplingRequest) -> SamplingResult:
+    """Run one synthesis and hand the device allocator cache back periodically.
+
+    InferenceRuntime only releases its accelerator cache in unload(), which never
+    runs while the server keeps a runtime resident. Long-lived serving therefore
+    accumulates allocator blocks across requests.
+    """
+    try:
+        return runtime.synthesize(request, log_fn=_log_runtime_message)
+    finally:
+        if _empty_cache_due():
+            _release_device_cache(runtime)
+
+
+def _empty_cache_due() -> bool:
+    """Count this synthesis and report whether a cache release is due."""
+    global _synthesis_since_empty_cache
+
+    interval = int(settings.empty_cache_interval)
+    if interval <= 0:
+        return False
+
+    with _empty_cache_lock:
+        _synthesis_since_empty_cache += 1
+        if _synthesis_since_empty_cache < interval:
+            return False
+        _synthesis_since_empty_cache = 0
+    return True
+
+
+def _release_device_cache(runtime: Any) -> None:
+    devices = {
+        getattr(runtime, "model_device", None),
+        getattr(runtime, "codec_device", None),
+    }
+    for device in devices:
+        device_type = getattr(device, "type", None)
+        if device_type == "cuda":
+            torch.cuda.empty_cache()
+        elif device_type == "mps":
+            mps = getattr(torch, "mps", None)
+            if mps is not None and hasattr(mps, "empty_cache"):
+                mps.empty_cache()
+        elif device_type == "xpu":
+            xpu = getattr(torch, "xpu", None)
+            if xpu is not None and hasattr(xpu, "empty_cache"):
+                xpu.empty_cache()
+
+
 def _get_synthesis_semaphore() -> asyncio.Semaphore:
     global _synthesis_semaphore, _synthesis_semaphore_limit
 
@@ -594,9 +646,9 @@ async def _synthesize_chunks(
 ) -> SamplingResult:
     if len(chunks) == 1:
         return await _run_blocking(
-            runtime.synthesize,
+            _synthesize_once,
+            runtime,
             sampling_request,
-            log_fn=_log_runtime_message,
         )
 
     results: list[SamplingResult] = []
@@ -604,9 +656,9 @@ async def _synthesize_chunks(
         logger.info("speech chunk %d/%d started: chars=%d", index, len(chunks), len(chunk))
         chunk_request = replace(sampling_request, text=chunk)
         chunk_result = await _run_blocking(
-            runtime.synthesize,
+            _synthesize_once,
+            runtime,
             chunk_request,
-            log_fn=_log_runtime_message,
         )
         logger.info(
             "speech chunk %d/%d completed: audio_seconds=%.2f",
@@ -659,9 +711,9 @@ def _stream_speech_response(
                 synthesis_semaphore = await _acquire_synthesis_slot()
                 try:
                     result = await _run_stream_blocking(
-                        runtime.synthesize,
+                        _synthesize_once,
+                        runtime,
                         chunk_request,
-                        log_fn=_log_runtime_message,
                     )
                 finally:
                     _release_synthesis_slot(synthesis_semaphore)

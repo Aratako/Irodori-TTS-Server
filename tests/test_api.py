@@ -1013,6 +1013,39 @@ def test_speech_rejects_invalid_first_sentence_chunk_min_chars(monkeypatch, valu
     assert runtime.texts == []
 
 
+@pytest.mark.parametrize(
+    ("interval", "expected"),
+    [
+        (0, [False] * 5),
+        (1, [True] * 5),
+        (3, [False, False, True, False, False]),
+    ],
+)
+def test_empty_cache_due_follows_configured_interval(monkeypatch, interval, expected):
+    monkeypatch.setattr(main.settings, "empty_cache_interval", interval)
+    monkeypatch.setattr(main, "_synthesis_since_empty_cache", 0)
+
+    assert [main._empty_cache_due() for _ in range(5)] == expected
+
+
+def test_empty_cache_due_counts_failed_syntheses(monkeypatch):
+    runtime = FakeRuntime(exc=RuntimeError("boom"))
+    monkeypatch.setattr(main.settings, "empty_cache_interval", 2)
+    monkeypatch.setattr(main, "_synthesis_since_empty_cache", 0)
+    released: list[object] = []
+    monkeypatch.setattr(main, "_release_device_cache", released.append)
+    request = main._build_sampling_request(
+        main.SpeechRequest(model="irodori-tts", input="こんにちは。", voice="none"),
+        main.VoiceSpec(voice_id="none", no_ref=True),
+    )
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            main._synthesize_once(runtime, request)
+
+    assert released == [runtime]
+
+
 def test_openai_speed_maps_to_inverse_duration_scale():
     payload = main.SpeechRequest(
         model="irodori-tts",
