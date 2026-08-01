@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import threading
 import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -29,6 +30,8 @@ logger = logging.getLogger(__name__)
 CHUNK_BOUNDARIES = frozenset("。、，,．.!！?？\n\r")
 _synthesis_semaphore: asyncio.Semaphore | None = None
 _synthesis_semaphore_limit: int | None = None
+_empty_cache_lock = threading.Lock()
+_synthesis_since_empty_cache = 0
 
 
 class IrodoriOptions(BaseModel):
@@ -455,7 +458,7 @@ async def _run_blocking(func: Any, *args: Any, **kwargs: Any) -> Any:
 
 
 def _synthesize_once(runtime: Any, request: SamplingRequest) -> SamplingResult:
-    """Run one synthesis and hand the device allocator cache back afterwards.
+    """Run one synthesis and hand the device allocator cache back periodically.
 
     InferenceRuntime only releases its accelerator cache in unload(), which never
     runs while the server keeps a runtime resident. Long-lived serving therefore
@@ -464,7 +467,24 @@ def _synthesize_once(runtime: Any, request: SamplingRequest) -> SamplingResult:
     try:
         return runtime.synthesize(request, log_fn=_log_runtime_message)
     finally:
-        _release_device_cache(runtime)
+        if _empty_cache_due():
+            _release_device_cache(runtime)
+
+
+def _empty_cache_due() -> bool:
+    """Count this synthesis and report whether a cache release is due."""
+    global _synthesis_since_empty_cache
+
+    interval = int(settings.empty_cache_interval)
+    if interval <= 0:
+        return False
+
+    with _empty_cache_lock:
+        _synthesis_since_empty_cache += 1
+        if _synthesis_since_empty_cache < interval:
+            return False
+        _synthesis_since_empty_cache = 0
+    return True
 
 
 def _release_device_cache(runtime: Any) -> None:

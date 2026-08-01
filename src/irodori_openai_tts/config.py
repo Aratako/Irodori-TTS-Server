@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     model_load_timeout: float = 300.0
     max_concurrent_synthesis: int = 1
     synthesis_wait_timeout: float = 300.0
+    empty_cache_interval: int = 10
 
     voices_dir: Path = Path("voices")
     voice_aliases_file: Path | None = None

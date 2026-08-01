@@ -428,6 +428,7 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 | `IRODORI_MODEL_LOAD_TIMEOUT` | `300` | Seconds to wait for model loading. |
 | `IRODORI_MAX_CONCURRENT_SYNTHESIS` | `1` | Maximum simultaneous synthesis jobs. |
 | `IRODORI_SYNTHESIS_WAIT_TIMEOUT` | `300` | Seconds to wait for a synthesis slot. |
+| `IRODORI_EMPTY_CACHE_INTERVAL` | `10` | Release the accelerator allocator cache every N syntheses. `0` disables it, `1` releases after every synthesis. |
 | `IRODORI_VOICES_DIR` | `voices` | Directory scanned for reference voices. |
 | `IRODORI_DEFAULT_VOICE` | unset | Used when request omits `voice`. |
 | `IRODORI_ALLOW_NO_REF_VOICE` | `true` | Allow `voice: "none"` text-only inference. |
