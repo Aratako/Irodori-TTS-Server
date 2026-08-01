@@ -62,8 +62,15 @@ By default, the server downloads [`Aratako/Irodori-TTS-v4-Small`](https://huggin
 IRODORI_CHECKPOINT=/path/to/model.safetensors
 ```
 
-For v4 checkpoints, keep the exported `tokenizer/` directory next to
-`model.safetensors`. Older checkpoints without bundled tokenizer assets continue
+`IRODORI_HF_CHECKPOINT` also accepts a checkpoint subfolder inside a Hugging Face repo:
+
+```bash
+IRODORI_HF_CHECKPOINT=Aratako/Irodori-TTS-v4-Small-Quantized/int8-weight-only
+```
+
+For local v4 checkpoints, keep the exported `tokenizer/` directory next to
+`model.safetensors`, or at the parent level when checkpoints are organized into
+variant subfolders. Older checkpoints without bundled tokenizer assets continue
 to use the tokenizer repository recorded in their checkpoint metadata.
 
 ## Running
@@ -543,8 +550,8 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 | `IRODORI_TTS_BACKEND` | `cu128` | Docker build backend: `cu128`, `rocm`, or `cpu`. |
 | `IRODORI_API_KEY` | unset | Optional bearer token. |
 | `IRODORI_MODEL_NAME` | `irodori-tts` | Model ID used in requests. |
-| `IRODORI_HF_CHECKPOINT` | `Aratako/Irodori-TTS-v4-Small` | Hugging Face repo containing `model.safetensors` and optional bundled tokenizer assets. |
-| `IRODORI_CHECKPOINT` | unset | Local checkpoint path. Takes precedence over `IRODORI_HF_CHECKPOINT`; keep a bundled `tokenizer/` beside v4 checkpoints. |
+| `IRODORI_HF_CHECKPOINT` | `Aratako/Irodori-TTS-v4-Small` | Hugging Face repo or `repo/subfolder` containing `model.safetensors` and optional bundled tokenizer assets. |
+| `IRODORI_CHECKPOINT` | unset | Local checkpoint path. Takes precedence over `IRODORI_HF_CHECKPOINT`; keep a bundled `tokenizer/` beside the checkpoint or above its variant subfolder. |
 | `IRODORI_CODEC_REPO` | `Aratako/Semantic-DACVAE-Japanese-32dim` | DACVAE codec repo or path. |
 | `IRODORI_MODEL_DEVICE` | `auto` | `auto`, `cuda`, `mps`, or `cpu`. |
 | `IRODORI_CODEC_DEVICE` | `auto` | `auto`, `cuda`, `mps`, or `cpu`. |
