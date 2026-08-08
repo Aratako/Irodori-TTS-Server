@@ -13,7 +13,17 @@ from functools import partial
 from typing import Any, Literal
 
 import torch
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -30,6 +40,8 @@ logger = logging.getLogger(__name__)
 CHUNK_BOUNDARIES = frozenset("。、，,．.!！?？\n\r")
 _synthesis_semaphore: asyncio.Semaphore | None = None
 _synthesis_semaphore_limit: int | None = None
+_synthesis_gate: SynthesisGate | None = None
+_synthesis_gate_loop: asyncio.AbstractEventLoop | None = None
 _empty_cache_lock = threading.Lock()
 _synthesis_since_empty_cache = 0
 
@@ -185,6 +197,7 @@ def health() -> dict[str, Any]:
             "load_timeout": settings.model_load_timeout,
             "max_concurrent_synthesis": settings.max_concurrent_synthesis,
             "synthesis_wait_timeout": settings.synthesis_wait_timeout,
+            "unload_wait_timeout": settings.unload_wait_timeout,
         },
         "voices": {
             "dir": str(voices_dir),
@@ -198,6 +211,29 @@ def health() -> dict[str, Any]:
             "first_sentence_chunk_min_chars": settings.default_first_sentence_chunk_min_chars,
         },
     }
+
+
+@app.post("/unload", dependencies=[Depends(require_auth)])
+async def unload_runtime(
+    timeout: float | None = Query(default=None, ge=0.0, le=3600.0),
+) -> dict[str, Any]:
+    """Release the resident runtime and its accelerator memory without exiting.
+
+    Waits for in-flight synthesis to finish (409 if it does not within timeout,
+    default IRODORI_UNLOAD_WAIT_TIMEOUT). Idempotent: unloading twice is a 200
+    with unloaded=false. The next synthesis reloads through the usual lazy path.
+    """
+    wait_timeout = float(settings.unload_wait_timeout) if timeout is None else float(timeout)
+    try:
+        async with _get_synthesis_gate().exclusive(wait_timeout):
+            unloaded = await _run_shielded_blocking(runtime_manager.unload)
+    except SynthesisBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeLoadTimeoutError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    logger.info("unload requested: unloaded=%s", unloaded)
+    return {"unloaded": bool(unloaded), "loaded": runtime_manager.is_loaded}
 
 
 @app.get("/v1/models", dependencies=[Depends(require_auth)])
@@ -349,21 +385,22 @@ async def create_speech(payload: SpeechRequest) -> Response:
             request_started_at,
         )
 
-    try:
-        runtime = await _run_blocking(runtime_manager.get)
-    except RuntimeLoadTimeoutError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    synthesis_semaphore = await _acquire_synthesis_slot()
-    try:
-        result = await _synthesize_chunks(runtime, sampling_request, chunks)
-    except (FileNotFoundError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        if "Dynamic LoRA loading is not compatible" in str(exc):
+    async with _get_synthesis_gate().synthesis():
+        try:
+            runtime = await _run_shielded_blocking(runtime_manager.get)
+        except RuntimeLoadTimeoutError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        synthesis_semaphore = await _acquire_synthesis_slot()
+        try:
+            result = await _synthesize_chunks(runtime, sampling_request, chunks)
+        except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        raise
-    finally:
-        _release_synthesis_slot(synthesis_semaphore)
+        except RuntimeError as exc:
+            if "Dynamic LoRA loading is not compatible" in str(exc):
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise
+        finally:
+            _release_synthesis_slot(synthesis_semaphore)
     audio_bytes = await _run_blocking(
         encode_audio,
         result.audio,
@@ -520,6 +557,146 @@ def _release_device_cache(runtime: Any) -> None:
                 xpu.empty_cache()
 
 
+class SynthesisBusyError(RuntimeError):
+    """Raised when exclusive access could not be taken before the timeout."""
+
+
+class SynthesisGate:
+    """Track requests that hold a runtime reference, so unload can exclude them.
+
+    The synthesis semaphore cannot serve this purpose: it bounds concurrency, and
+    the SSE path releases it between chunks while still holding the runtime it
+    resolved once at the start of the stream. Unloading in that window would
+    delete the model out from under the next chunk. This gate is held for the
+    whole request instead, and it is acquired before the runtime is resolved so
+    that holding a runtime always implies holding the gate.
+
+    Every state change here is a plain assignment, never an ``await``. That is
+    deliberate and load-bearing: this gate is released while a cancellation is
+    being delivered, and anyio re-fires that cancellation on every event loop
+    iteration until the task ends. Any ``await`` on the release path -- taking a
+    lock included -- can therefore be interrupted before the state is restored,
+    leaking a reservation that blocks every later request with no way back short
+    of restarting the process. ``asyncio.Condition`` was tried first and is what
+    made the release path awaitable; the lock it offered was never needed, since
+    a single-threaded loop cannot interleave anywhere except at an ``await``.
+    """
+
+    def __init__(self) -> None:
+        self._active = 0
+        self._unloading = False
+        # Woken when _active reaches 0 / when _unloading clears, respectively.
+        self._idle_waiters: set[asyncio.Future[None]] = set()
+        self._resume_waiters: set[asyncio.Future[None]] = set()
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    @staticmethod
+    def _wake(waiters: set[asyncio.Future[None]]) -> None:
+        for waiter in list(waiters):
+            if not waiter.done():
+                waiter.set_result(None)
+        waiters.clear()
+
+    @staticmethod
+    def _new_waiter(waiters: set[asyncio.Future[None]]) -> asyncio.Future[None]:
+        """Register a waiter synchronously, before the caller awaits anything.
+
+        Registration must not happen inside a coroutine that someone else turns
+        into a task -- ``asyncio.wait_for`` does exactly that, and the wake we
+        are waiting for can land in the gap before the task first runs. The
+        waiter would then never be in the set when ``_wake`` iterates it, and
+        the wait would run to its timeout with the condition already true.
+        """
+        waiter = asyncio.get_running_loop().create_future()
+        waiters.add(waiter)
+        return waiter
+
+    def _end_reservation(self) -> None:
+        self._unloading = False
+        self._wake(self._resume_waiters)
+
+    @asynccontextmanager
+    async def synthesis(self) -> AsyncIterator[None]:
+        # Wait out an in-progress unload rather than racing it, so a steady
+        # request stream cannot make the model disappear mid-request. Re-check
+        # in a loop: being woken only means _unloading was false at that moment,
+        # and another unload may reserve the gate before this task is resumed.
+        while self._unloading:
+            waiter = self._new_waiter(self._resume_waiters)
+            try:
+                await waiter
+            finally:
+                self._resume_waiters.discard(waiter)
+        # No await between the check and the increment, so the pair is atomic
+        # with respect to the loop -- nothing can reserve the gate in between.
+        self._active += 1
+        try:
+            yield
+        finally:
+            self._active -= 1
+            if self._active == 0:
+                self._wake(self._idle_waiters)
+
+    @asynccontextmanager
+    async def exclusive(self, timeout: float) -> AsyncIterator[None]:
+        """Block new synthesis and wait for in-flight ones out.
+
+        Raises SynthesisBusyError when they do not finish within the timeout.
+        """
+        wait_timeout = max(0.0, float(timeout))
+        if self._unloading:
+            raise SynthesisBusyError("Another unload is already in progress.")
+        # Reserve the gate *before* waiting. While we wait, synthesis() only
+        # checks _unloading, so leaving it false lets a steady stream of short
+        # requests keep _active above zero and starve unload forever -- a
+        # longer timeout makes that worse, not better.
+        self._unloading = True
+        try:
+            # The reservation above stops _active from growing again, so one
+            # wake is enough: once it reaches 0 under our reservation it stays 0.
+            if self._active != 0:
+                waiter = self._new_waiter(self._idle_waiters)
+                try:
+                    await asyncio.wait_for(waiter, timeout=wait_timeout)
+                finally:
+                    self._idle_waiters.discard(waiter)
+        except asyncio.TimeoutError as exc:
+            self._end_reservation()
+            raise SynthesisBusyError(
+                f"Synthesis is still in flight. Retry after a moment. timeout={wait_timeout:.1f}s"
+            ) from exc
+        except BaseException:
+            # Nothing has been yielded yet, so the release in the ``finally``
+            # below is unreachable from here. Leaving the reservation set would
+            # block every later synthesis forever (they wait on ``not
+            # _unloading`` without a timeout) and answer every later unload
+            # with 409.
+            self._end_reservation()
+            raise
+        try:
+            yield
+        finally:
+            self._end_reservation()
+
+
+def _get_synthesis_gate() -> SynthesisGate:
+    """Return the gate bound to the running loop, recreating it if the loop changed.
+
+    asyncio primitives bind to the loop that first uses them, so a gate created
+    under one loop (tests spin up one per client) must not leak into the next.
+    """
+    global _synthesis_gate, _synthesis_gate_loop
+
+    loop = asyncio.get_running_loop()
+    if _synthesis_gate is None or _synthesis_gate_loop is not loop:
+        _synthesis_gate = SynthesisGate()
+        _synthesis_gate_loop = loop
+    return _synthesis_gate
+
+
 def _get_synthesis_semaphore() -> asyncio.Semaphore:
     global _synthesis_semaphore, _synthesis_semaphore_limit
 
@@ -645,7 +822,7 @@ async def _synthesize_chunks(
     chunks: list[str],
 ) -> SamplingResult:
     if len(chunks) == 1:
-        return await _run_blocking(
+        return await _run_shielded_blocking(
             _synthesize_once,
             runtime,
             sampling_request,
@@ -655,7 +832,7 @@ async def _synthesize_chunks(
     for index, chunk in enumerate(chunks, start=1):
         logger.info("speech chunk %d/%d started: chars=%d", index, len(chunks), len(chunk))
         chunk_request = replace(sampling_request, text=chunk)
-        chunk_result = await _run_blocking(
+        chunk_result = await _run_shielded_blocking(
             _synthesize_once,
             runtime,
             chunk_request,
@@ -699,50 +876,53 @@ def _stream_speech_response(
     async def events() -> AsyncIterator[str]:
         completed = 0
         try:
-            runtime = await _run_blocking(runtime_manager.get)
-            for index, chunk in enumerate(chunks):
-                logger.info(
-                    "speech stream chunk %d/%d started: chars=%d",
-                    index + 1,
-                    len(chunks),
-                    len(chunk),
-                )
-                chunk_request = replace(sampling_request, text=chunk)
-                synthesis_semaphore = await _acquire_synthesis_slot()
-                try:
-                    result = await _run_stream_blocking(
-                        _synthesize_once,
-                        runtime,
-                        chunk_request,
+            # Held across every chunk: the per-chunk semaphore goes slack between
+            # chunks, but this stream keeps using the runtime it resolved here.
+            async with _get_synthesis_gate().synthesis():
+                runtime = await _run_shielded_blocking(runtime_manager.get)
+                for index, chunk in enumerate(chunks):
+                    logger.info(
+                        "speech stream chunk %d/%d started: chars=%d",
+                        index + 1,
+                        len(chunks),
+                        len(chunk),
                     )
-                finally:
-                    _release_synthesis_slot(synthesis_semaphore)
-                audio_bytes = await _run_stream_blocking(
-                    encode_audio,
-                    result.audio,
-                    result.sample_rate,
-                    response_format,
-                )
-                completed += 1
-                logger.info(
-                    "speech stream chunk %d/%d completed: audio_seconds=%.2f bytes=%d",
-                    index + 1,
-                    len(chunks),
-                    _audio_duration_seconds(result.audio, result.sample_rate),
-                    len(audio_bytes),
-                )
-                yield _sse_event(
-                    "audio_chunk",
-                    {
-                        "index": index,
-                        "text": chunk,
-                        "format": response_format,
-                        "media_type": CONTENT_TYPES[response_format],
-                        "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
-                        "seed": result.used_seed,
-                        "total_to_decode": result.total_to_decode,
-                    },
-                )
+                    chunk_request = replace(sampling_request, text=chunk)
+                    synthesis_semaphore = await _acquire_synthesis_slot()
+                    try:
+                        result = await _run_shielded_blocking(
+                            _synthesize_once,
+                            runtime,
+                            chunk_request,
+                        )
+                    finally:
+                        _release_synthesis_slot(synthesis_semaphore)
+                    audio_bytes = await _run_shielded_blocking(
+                        encode_audio,
+                        result.audio,
+                        result.sample_rate,
+                        response_format,
+                    )
+                    completed += 1
+                    logger.info(
+                        "speech stream chunk %d/%d completed: audio_seconds=%.2f bytes=%d",
+                        index + 1,
+                        len(chunks),
+                        _audio_duration_seconds(result.audio, result.sample_rate),
+                        len(audio_bytes),
+                    )
+                    yield _sse_event(
+                        "audio_chunk",
+                        {
+                            "index": index,
+                            "text": chunk,
+                            "format": response_format,
+                            "media_type": CONTENT_TYPES[response_format],
+                            "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+                            "seed": result.used_seed,
+                            "total_to_decode": result.total_to_decode,
+                        },
+                    )
         except RuntimeLoadTimeoutError as exc:
             yield _sse_error_event(str(exc), error_type="server_error", code="runtime_unavailable")
             return
@@ -775,13 +955,46 @@ def _stream_speech_response(
     )
 
 
-async def _run_stream_blocking(func: Any, *args: Any, **kwargs: Any) -> Any:
+async def _run_shielded_blocking(func: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run blocking work without abandoning the worker thread on cancellation.
+
+    Cancelling an ``await run_in_executor(...)`` only stops the waiting; the
+    worker thread keeps running and keeps using whatever it was handed. Every
+    call made while holding the synthesis gate must go through here, or the
+    gate would be released (and the runtime unloaded) under a live worker.
+
+    A single ``shield`` is not enough. Cancellation here arrives from an anyio
+    cancel scope (Starlette cancels the response task group when the client
+    disconnects), and anyio re-delivers it on every event loop iteration until
+    the task actually ends. The second delivery lands while we are awaiting the
+    unshielded task and takes it down with us, so the shield must be re-taken
+    for as long as the worker thread is still running.
+
+    Re-taking it needs one escape hatch. ``shield`` only defends against
+    cancellation aimed at *us*; if the inner task itself is cancelled it
+    finishes cancelled, and awaiting an already-cancelled future re-raises
+    synchronously without ever yielding to the loop. Looping on that would be a
+    pure CPU spin that freezes the whole event loop, not just this request --
+    reachable because loop shutdown (``asyncio.runners._cancel_all_tasks``)
+    cancels every surviving task, inner ones included.
+    """
     task = asyncio.create_task(_run_blocking(func, *args, **kwargs))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        await task
-        raise
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            if task.cancelled():
+                # The worker's task is gone; there is nothing left to outlive
+                # and nothing left to await. Spinning here would hang the loop.
+                raise
+            cancelled = True
+    if cancelled:
+        # Absorbed above only to outlive the worker thread; the caller (and the
+        # surrounding cancel scope) must still see the request as cancelled.
+        raise asyncio.CancelledError
+    return result
 
 
 def _sse_event(event: str, data: dict[str, Any]) -> str:
