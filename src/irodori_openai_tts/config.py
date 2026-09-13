@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     allow_no_ref_voice: bool = True
 
     default_response_format: str = "wav"
-    default_num_steps: int = 40
+    default_num_steps: int | None = None
     default_t_schedule_mode: str = "linear"
     default_sway_coeff: float = -1.0
     default_duration_scale: float = 1.0

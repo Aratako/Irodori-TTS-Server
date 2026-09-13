@@ -9,6 +9,19 @@ from irodori_openai_tts.config import Settings
 from irodori_openai_tts.runtime import RuntimeLoadTimeoutError, RuntimeManager
 
 
+def test_sampling_steps_default_to_model_default(monkeypatch):
+    monkeypatch.delenv("IRODORI_DEFAULT_NUM_STEPS", raising=False)
+
+    assert Settings(_env_file=None).default_num_steps is None
+
+
+@pytest.mark.parametrize("steps", [4, 40])
+def test_sampling_steps_environment_override(monkeypatch, steps):
+    monkeypatch.setenv("IRODORI_DEFAULT_NUM_STEPS", str(steps))
+
+    assert Settings(_env_file=None).default_num_steps == steps
+
+
 def test_runtime_load_timeout_while_another_thread_is_loading(tmp_path, monkeypatch):
     checkpoint = tmp_path / "model.safetensors"
     checkpoint.write_bytes(b"test")

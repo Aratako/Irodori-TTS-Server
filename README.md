@@ -73,6 +73,18 @@ For local v4 checkpoints, keep the exported `tokenizer/` directory next to
 variant subfolders. Older checkpoints without bundled tokenizer assets continue
 to use the tokenizer repository recorded in their checkpoint metadata.
 
+For MeanFlow inference, set:
+
+```bash
+IRODORI_HF_CHECKPOINT=Aratako/Irodori-TTS-v4.1-Small-MF
+```
+
+The runtime selects the MeanFlow sampler automatically. Leave
+`IRODORI_DEFAULT_NUM_STEPS` unset to use the model default (RF: 40, MeanFlow: 4).
+If an existing `.env` sets it to `40`, remove or comment out that line to enable
+the model default. Request-level `num_steps` overrides the server default.
+Inference-time CFG and Sway Sampling settings are ignored for MeanFlow checkpoints.
+
 ## Running
 
 ```bash
@@ -338,7 +350,7 @@ Common `irodori` options:
 
 | Field | Notes |
 | --- | --- |
-| `num_steps` | Number of diffusion steps. Higher can improve quality but takes longer. |
+| `num_steps` | Sampling steps. Overrides `IRODORI_DEFAULT_NUM_STEPS`; if neither is set, uses the model default (RF: 40, MeanFlow: 4). |
 | `seed` | Fixed random seed for reproducible output. |
 | `cfg_scale_text` | Strength of text guidance. |
 | `cfg_scale_speaker` | Strength of speaker/reference-voice guidance. |
@@ -568,7 +580,7 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 | `IRODORI_DEFAULT_VOICE` | unset | Used when request omits `voice`. |
 | `IRODORI_ALLOW_NO_REF_VOICE` | `true` | Allow `voice: "none"` text-only inference. |
 | `IRODORI_DEFAULT_RESPONSE_FORMAT` | `wav` | Default response format. |
-| `IRODORI_DEFAULT_NUM_STEPS` | `40` | Default diffusion steps. |
+| `IRODORI_DEFAULT_NUM_STEPS` | unset | Default sampling steps. When unset, uses the model default (RF: 40, MeanFlow: 4). |
 | `IRODORI_DEFAULT_T_SCHEDULE_MODE` | `linear` | Default timestep schedule. |
 | `IRODORI_DEFAULT_SWAY_COEFF` | `-1.0` | Default sway coefficient. Used only when `t_schedule_mode` is `sway`. |
 | `IRODORI_DEFAULT_DURATION_SCALE` | `1.0` | Default duration scale. |

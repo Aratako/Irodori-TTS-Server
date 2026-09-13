@@ -113,6 +113,42 @@ def test_models_lists_configured_model():
     assert data[0]["id"] == main.settings.model_name
 
 
+@pytest.mark.parametrize(
+    ("server_default", "request_options", "expected_steps"),
+    [
+        (None, {}, None),
+        (None, {"irodori": {"num_steps": None}}, None),
+        (40, {}, 40),
+        (4, {}, 4),
+        (None, {"num_steps": 8}, 8),
+        (40, {"num_steps": 8}, 8),
+        (40, {"irodori": {"num_steps": 4}}, 4),
+        (40, {"num_steps": 8, "irodori": {"num_steps": 1}}, 1),
+        (40, {"num_steps": 8, "irodori": {"num_steps": None}}, 8),
+    ],
+)
+def test_speech_sampling_step_precedence(
+    monkeypatch, server_default, request_options, expected_steps
+):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    monkeypatch.setattr(main.settings, "default_num_steps", server_default)
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "こんにちは。",
+            "voice": "none",
+            **request_options,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(runtime.requests) == 1
+    assert runtime.requests[0].num_steps == expected_steps
+
+
 def test_auth_required_when_api_key_is_configured(monkeypatch):
     monkeypatch.setattr(main.settings, "api_key", "secret")
     client = TestClient(main.app)

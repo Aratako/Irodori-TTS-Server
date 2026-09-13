@@ -917,7 +917,7 @@ def _build_sampling_request(payload: SpeechRequest, voice: VoiceSpec) -> Samplin
             _coalesce(opts.max_caption_len, _extra(payload, "max_caption_len"), None),
             "max_caption_len",
         ),
-        num_steps=_as_int(
+        num_steps=_as_optional_int(
             _coalesce(opts.num_steps, _extra(payload, "num_steps"), settings.default_num_steps),
             "num_steps",
         ),
