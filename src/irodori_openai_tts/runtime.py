@@ -27,6 +27,10 @@ class RuntimeManager:
         self._lock = threading.Lock()
         self._runtime: InferenceRuntime | None = None
         self._checkpoint_path: str | None = None
+        # Distinguishes "no runtime yet, someone is loading it" from "no runtime
+        # anymore, someone is tearing it down": both hold the lock with
+        # _runtime set to None, so is_loading cannot tell them apart on its own.
+        self._unloading = False
 
     def get(self) -> InferenceRuntime:
         if self._runtime is not None:
@@ -65,6 +69,38 @@ class RuntimeManager:
         finally:
             self._lock.release()
 
+    def unload(self) -> bool:
+        """Drop the resident runtime and release its accelerator memory.
+
+        Returns True when a runtime was actually released, False when nothing was
+        loaded. Callers must guarantee that no synthesis is in flight:
+        InferenceRuntime.unload() deletes the model attributes, so a concurrent
+        synthesize() on the same object would fail.
+        """
+        timeout = float(self.settings.model_load_timeout)
+        acquired = self._lock.acquire(timeout=max(timeout, 0.0))
+        if not acquired:
+            raise RuntimeLoadTimeoutError(
+                f"Model is still loading. Retry after a moment. timeout={timeout:.1f}s"
+            )
+
+        try:
+            runtime = self._runtime
+            if runtime is None:
+                return False
+            # Drop our reference first so a failing unload() cannot leave a
+            # half-released runtime reachable from get().
+            self._unloading = True
+            self._runtime = None
+            logger.info("unloading runtime")
+            t0 = time.perf_counter()
+            runtime.unload()
+            logger.info("runtime unloaded in %.2fs", time.perf_counter() - t0)
+            return True
+        finally:
+            self._unloading = False
+            self._lock.release()
+
     @property
     def checkpoint_path(self) -> str | None:
         return self._checkpoint_path
@@ -75,7 +111,12 @@ class RuntimeManager:
 
     @property
     def is_loading(self) -> bool:
-        return self._runtime is None and self._lock.locked()
+        # ⚠️ The _unloading term is load-bearing, not defensive. unload() clears
+        # _runtime while still holding the lock, so without it every /health poll
+        # during a teardown reports loading=true -- the exact opposite of what is
+        # happening, and for the whole of the slowest part (freeing accelerator
+        # memory). Monitors would read an unload as a model load.
+        return self._runtime is None and self._lock.locked() and not self._unloading
 
     def _resolve_checkpoint_path(self) -> str:
         if self.settings.checkpoint is not None and str(self.settings.checkpoint).strip() != "":

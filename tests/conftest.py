@@ -17,6 +17,9 @@ def restore_app_globals(monkeypatch, tmp_path):
     monkeypatch.setattr(main.settings, "default_first_sentence_chunk_min_chars", None)
     monkeypatch.setattr(main.settings, "max_concurrent_synthesis", 1)
     monkeypatch.setattr(main.settings, "synthesis_wait_timeout", 300.0)
+    monkeypatch.setattr(main.settings, "unload_wait_timeout", 30.0)
     monkeypatch.setattr(main, "_synthesis_semaphore", None)
     monkeypatch.setattr(main, "_synthesis_semaphore_limit", None)
+    monkeypatch.setattr(main, "_synthesis_gate", None)
+    monkeypatch.setattr(main, "_synthesis_gate_loop", None)
     yield

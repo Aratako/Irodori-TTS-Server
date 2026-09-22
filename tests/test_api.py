@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import subprocess
+import sys
 import threading
+import time
 
 import pytest
 import torch
@@ -50,6 +53,16 @@ class FakeRuntimeManager:
         self.is_loaded = runtime is not None
         self.is_loading = exc is not None
         self.thread_ids: list[int] = []
+        self.unload_calls = 0
+
+    def unload(self) -> bool:
+        self.unload_calls += 1
+        if self.exc is not None:
+            raise self.exc
+        unloaded = bool(self.is_loaded)
+        self.is_loaded = False
+        self.runtime = None
+        return unloaded
 
     def get(self):
         self.thread_ids.append(threading.get_ident())
@@ -1094,3 +1107,394 @@ def test_openai_speed_maps_to_inverse_duration_scale():
     request = main._build_sampling_request(payload, voice)
 
     assert request.duration_scale == 0.8
+
+
+def test_unload_releases_runtime_and_reports_state(monkeypatch):
+    manager = FakeRuntimeManager(runtime=FakeRuntime())
+    monkeypatch.setattr(main, "runtime_manager", manager)
+
+    response = TestClient(main.app).post("/unload")
+
+    assert response.status_code == 200
+    assert response.json() == {"unloaded": True, "loaded": False}
+    assert manager.unload_calls == 1
+
+
+def test_unload_is_idempotent_when_nothing_is_loaded(monkeypatch):
+    manager = FakeRuntimeManager(runtime=None)
+    monkeypatch.setattr(main, "runtime_manager", manager)
+
+    response = TestClient(main.app).post("/unload")
+
+    assert response.status_code == 200
+    assert response.json() == {"unloaded": False, "loaded": False}
+
+
+def test_unload_returns_503_when_model_is_loading(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "runtime_manager",
+        FakeRuntimeManager(exc=RuntimeLoadTimeoutError("Model is still loading.")),
+    )
+
+    response = TestClient(main.app).post("/unload")
+
+    assert response.status_code == 503
+
+
+def test_unload_requires_api_key_when_configured(monkeypatch):
+    manager = FakeRuntimeManager(runtime=FakeRuntime())
+    monkeypatch.setattr(main, "runtime_manager", manager)
+    monkeypatch.setattr(main.settings, "api_key", "secret")
+
+    client = TestClient(main.app)
+    unauthorized = client.post("/unload")
+
+    assert unauthorized.status_code == 401
+    assert manager.unload_calls == 0
+
+    authorized = client.post("/unload", headers={"Authorization": "Bearer secret"})
+
+    assert authorized.status_code == 200
+    assert manager.unload_calls == 1
+
+
+def test_unload_conflicts_with_in_flight_synthesis(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingRuntime(FakeRuntime):
+        def synthesize(self, req, *, log_fn=None):
+            entered.set()
+            assert release.wait(timeout=10)
+            return super().synthesize(req, log_fn=log_fn)
+
+    manager = FakeRuntimeManager(runtime=BlockingRuntime())
+    monkeypatch.setattr(main, "runtime_manager", manager)
+
+    with TestClient(main.app) as client:
+        speech: list[int] = []
+
+        def run_speech():
+            speech.append(
+                client.post(
+                    "/v1/audio/speech",
+                    json={
+                        "model": "irodori-tts",
+                        "input": "こんにちは。",
+                        "voice": "none",
+                        "response_format": "wav",
+                    },
+                ).status_code
+            )
+
+        thread = threading.Thread(target=run_speech)
+        thread.start()
+        try:
+            assert entered.wait(timeout=10)
+            response = client.post("/unload", params={"timeout": 0.05})
+        finally:
+            release.set()
+            thread.join(timeout=10)
+
+    assert response.status_code == 409
+    assert "still in flight" in response.json()["error"]["message"]
+    assert manager.unload_calls == 0
+    assert speech == [200]
+
+
+def test_stream_holds_the_gate_across_chunk_boundaries(monkeypatch):
+    """The per-chunk semaphore goes slack between chunks; the gate must not.
+
+    Regression guard: unloading between two SSE chunks would delete the model
+    the stream is still holding.
+    """
+    observed: list[int] = []
+
+    class GateObservingRuntime(FakeRuntime):
+        def synthesize(self, req, *, log_fn=None):
+            gate = main._synthesis_gate
+            observed.append(-1 if gate is None else gate.active)
+            return super().synthesize(req, log_fn=log_fn)
+
+    runtime = GateObservingRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    monkeypatch.setattr(main.settings, "default_first_sentence_chunk_min_chars", 1)
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "最初は速く、すぐ返します。",
+            "voice": "none",
+            "response_format": "wav",
+            "stream_format": "sse",
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(runtime.texts) > 1, "test needs a multi-chunk stream to be meaningful"
+    assert observed == [1] * len(runtime.texts)
+
+
+def test_synthesis_gate_blocks_unload_until_the_request_finishes():
+    async def scenario():
+        gate = main.SynthesisGate()
+        order: list[str] = []
+
+        async def synthesize():
+            async with gate.synthesis():
+                order.append("synthesis:start")
+                await asyncio.sleep(0.05)
+                order.append("synthesis:end")
+
+        async def unload():
+            await asyncio.sleep(0.01)
+            async with gate.exclusive(timeout=5.0):
+                order.append("unload")
+
+        await asyncio.gather(synthesize(), unload())
+        return order
+
+    assert asyncio.run(scenario()) == ["synthesis:start", "synthesis:end", "unload"]
+
+
+def test_synthesis_gate_raises_busy_when_the_wait_times_out():
+    async def scenario():
+        gate = main.SynthesisGate()
+        async with gate.synthesis():
+            with pytest.raises(main.SynthesisBusyError):
+                async with gate.exclusive(timeout=0.01):
+                    pass
+        # The failed attempt must not leave new synthesis blocked out.
+        async with gate.exclusive(timeout=1.0):
+            pass
+        return gate.active
+
+    assert asyncio.run(scenario()) == 0
+
+
+def test_synthesis_gate_makes_new_requests_wait_out_an_unload():
+    async def scenario():
+        gate = main.SynthesisGate()
+        order: list[str] = []
+
+        async def unload():
+            async with gate.exclusive(timeout=5.0):
+                order.append("unload:start")
+                await asyncio.sleep(0.05)
+                order.append("unload:end")
+
+        async def synthesize():
+            await asyncio.sleep(0.01)
+            async with gate.synthesis():
+                order.append("synthesis")
+
+        await asyncio.gather(unload(), synthesize())
+        return order
+
+    assert asyncio.run(scenario()) == ["unload:start", "unload:end", "synthesis"]
+
+
+def test_synthesis_gate_unloads_an_idle_runtime_with_a_zero_timeout():
+    # asyncio.wait_for(..., timeout=0) cancels the waiter before the predicate is
+    # ever evaluated, so ?timeout=0 used to answer 409 on a completely idle server.
+    async def scenario():
+        gate = main.SynthesisGate()
+        async with gate.exclusive(timeout=0.0):
+            return "acquired"
+
+    assert asyncio.run(scenario()) == "acquired"
+
+
+def test_synthesis_gate_is_not_starved_by_a_steady_request_stream():
+    # Individually short requests that keep overlapping used to hold _active above
+    # zero forever, so unload could never win no matter how long its timeout was.
+    async def scenario():
+        gate = main.SynthesisGate()
+        stop = asyncio.Event()
+
+        async def churn():
+            while not stop.is_set():
+                async with gate.synthesis():
+                    await asyncio.sleep(0.005)
+
+        workers = [asyncio.create_task(churn()) for _ in range(3)]
+        await asyncio.sleep(0.02)
+        try:
+            async with gate.exclusive(timeout=2.0):
+                acquired = True
+        finally:
+            stop.set()
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+        return acquired
+
+    assert asyncio.run(scenario()) is True
+
+
+def test_synthesis_gate_rejects_a_second_concurrent_unload():
+    async def scenario():
+        gate = main.SynthesisGate()
+        async with gate.exclusive(timeout=1.0):
+            with pytest.raises(main.SynthesisBusyError) as excinfo:
+                async with gate.exclusive(timeout=1.0):
+                    pass
+        return str(excinfo.value)
+
+    assert "Another unload" in asyncio.run(scenario())
+
+
+def test_cancelled_synthesis_keeps_the_gate_until_the_worker_thread_finishes():
+    # Cancelling an `await run_in_executor(...)` does not stop the worker thread.
+    # Releasing the gate at that point would let unload delete the model while the
+    # thread is still synthesizing with it.
+    running = threading.Event()
+    finished = threading.Event()
+
+    def blocking_work():
+        running.set()
+        time.sleep(0.3)
+        finished.set()
+
+    async def scenario():
+        gate = main.SynthesisGate()
+
+        async def request():
+            async with gate.synthesis():
+                await main._run_shielded_blocking(blocking_work)
+
+        task = asyncio.create_task(request())
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, running.wait, 5)
+        # Cancel the way an anyio cancel scope does: re-deliver on every loop
+        # iteration until the task actually ends. A single `cancel()` is a
+        # weaker test that a one-shot shield already passes, while Starlette's
+        # disconnect handling always produces this repeated form.
+        for _ in range(1000):
+            if task.done():
+                break
+            task.cancel()
+            await asyncio.sleep(0)
+        await asyncio.gather(task, return_exceptions=True)
+
+        # The gate must not have been handed over while the thread was still busy.
+        escaped = not finished.is_set()
+        async with gate.exclusive(timeout=1.0):
+            pass
+        return escaped
+
+    assert asyncio.run(scenario()) is False
+
+
+def test_exclusive_releases_the_reservation_when_its_wait_is_cancelled():
+    # `exclusive()` reserves the gate before waiting for in-flight synthesis.
+    # If that wait is cancelled (server shutdown, or a Starlette version that
+    # cancels handlers on disconnect), nothing has been yielded yet, so the
+    # release in the context manager's `finally` never runs. A leaked
+    # reservation blocks every later synthesis forever -- they wait on
+    # `not _unloading` with no timeout -- and answers every later unload 409.
+    async def scenario():
+        gate = main.SynthesisGate()
+
+        async def holder():
+            async with gate.synthesis():
+                await asyncio.sleep(3600)
+
+        held = asyncio.create_task(holder())
+        while gate.active == 0:
+            await asyncio.sleep(0)
+
+        async def unloader():
+            async with gate.exclusive(timeout=3600):
+                pass
+
+        waiting = asyncio.create_task(unloader())
+        await asyncio.sleep(0.05)  # let it get into the wait
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+
+        held.cancel()
+        await asyncio.gather(held, return_exceptions=True)
+
+        # A later unload must not be told that one is already in progress. A
+        # leaked reservation surfaces here as SynthesisBusyError rather than a
+        # hang, because `exclusive()` checks `_unloading` before it waits.
+        try:
+            async with gate.exclusive(timeout=1.0):
+                pass
+        except main.SynthesisBusyError as exc:
+            return f"busy: {exc}"
+        return "ok"
+
+    assert asyncio.run(scenario()) == "ok"
+
+
+def test_gate_release_survives_repeated_cancellation():
+    # The gate's release path must contain no `await` at all. Anything
+    # awaitable there -- taking a lock included -- can be interrupted before
+    # the counters are restored, and anyio re-fires cancellation on every loop
+    # iteration until the task ends, so "it usually gets through" is not a
+    # property this can rely on. A leaked `_active` makes every later unload
+    # answer 409 forever.
+    async def scenario():
+        gate = main.SynthesisGate()
+
+        async def victim():
+            async with gate.synthesis():
+                await asyncio.sleep(0.05)
+
+        task = asyncio.create_task(victim())
+        while gate.active == 0:
+            await asyncio.sleep(0)
+
+        # Cancel the way an anyio cancel scope does: re-deliver until it ends.
+        for _ in range(1000):
+            if task.done():
+                break
+            task.cancel()
+            await asyncio.sleep(0)
+        await asyncio.gather(task, return_exceptions=True)
+        return gate.active
+
+    assert asyncio.run(scenario()) == 0
+
+
+_SPIN_PROBE = """
+import asyncio, time
+from irodori_openai_tts import app as main
+
+async def scenario():
+    task = asyncio.create_task(main._run_shielded_blocking(time.sleep, 0.5))
+    await asyncio.sleep(0.05)
+    for other in asyncio.all_tasks():   # runners._cancel_all_tasks equivalent
+        if other is not asyncio.current_task():
+            other.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+asyncio.run(scenario())
+"""
+
+
+def test_shielded_blocking_propagates_cancellation_of_its_own_task():
+    # `shield` only defends against cancellation aimed at the caller. If the
+    # inner task is cancelled it finishes cancelled, and awaiting an
+    # already-cancelled future re-raises synchronously without ever yielding --
+    # so re-taking the shield in a loop would be a pure CPU spin that freezes
+    # the whole event loop, not just this request. Loop shutdown
+    # (asyncio.runners._cancel_all_tasks) cancels inner tasks exactly like this.
+    #
+    # This runs out-of-process on purpose: the failure mode is a frozen loop,
+    # so an in-process timeout would never fire and the suite would hang here
+    # instead of reporting a failure.
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _SPIN_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("_run_shielded_blocking span the event loop on inner cancellation")
+    assert proc.returncode == 0, proc.stderr

@@ -575,6 +575,10 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 | `IRODORI_MODEL_LOAD_TIMEOUT` | `300` | Seconds to wait for model loading. |
 | `IRODORI_MAX_CONCURRENT_SYNTHESIS` | `1` | Maximum simultaneous synthesis jobs. |
 | `IRODORI_SYNTHESIS_WAIT_TIMEOUT` | `300` | Seconds to wait for a synthesis slot. |
+| `IRODORI_UNLOAD_WAIT_TIMEOUT` | `30` | Seconds `POST /unload` waits for in-flight synthesis before returning 409. |
+| `IRODORI_PROFILE_LOCK_PATH` | unset | Optional shared file-lock path for multiple Irodori processes using one accelerator. |
+| `IRODORI_PROFILE_PEER_URLS` | unset | Comma-separated peer base URLs to unload while holding the shared profile lock. Exclude this process's own URL. |
+| `IRODORI_PROFILE_SWITCH_TIMEOUT` | `630` | Seconds to wait for the shared profile lock and peer unload requests. |
 | `IRODORI_EMPTY_CACHE_INTERVAL` | `10` | Release the accelerator allocator cache every N syntheses. `0` disables it, `1` releases after every synthesis. |
 | `IRODORI_VOICES_DIR` | `voices` | Directory scanned for reference voices. |
 | `IRODORI_DEFAULT_VOICE` | unset | Used when request omits `voice`. |
