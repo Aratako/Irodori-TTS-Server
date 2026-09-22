@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import threading
 import time
 from collections.abc import AsyncIterator, Mapping
@@ -12,6 +13,7 @@ from dataclasses import replace
 from functools import partial
 from typing import Any, Literal
 
+import httpx
 import torch
 from fastapi import (
     Depends,
@@ -198,6 +200,8 @@ def health() -> dict[str, Any]:
             "max_concurrent_synthesis": settings.max_concurrent_synthesis,
             "synthesis_wait_timeout": settings.synthesis_wait_timeout,
             "unload_wait_timeout": settings.unload_wait_timeout,
+            "profile_lock_enabled": settings.profile_lock_path is not None,
+            "profile_peer_count": len(_profile_peer_urls()),
         },
         "voices": {
             "dir": str(voices_dir),
@@ -385,22 +389,23 @@ async def create_speech(payload: SpeechRequest) -> Response:
             request_started_at,
         )
 
-    async with _get_synthesis_gate().synthesis():
-        try:
-            runtime = await _run_shielded_blocking(runtime_manager.get)
-        except RuntimeLoadTimeoutError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        synthesis_semaphore = await _acquire_synthesis_slot()
-        try:
-            result = await _synthesize_chunks(runtime, sampling_request, chunks)
-        except (FileNotFoundError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except RuntimeError as exc:
-            if "Dynamic LoRA loading is not compatible" in str(exc):
+    async with _coordinated_synthesis():
+        async with _get_synthesis_gate().synthesis():
+            try:
+                runtime = await _run_shielded_blocking(runtime_manager.get)
+            except RuntimeLoadTimeoutError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            synthesis_semaphore = await _acquire_synthesis_slot()
+            try:
+                result = await _synthesize_chunks(runtime, sampling_request, chunks)
+            except (FileNotFoundError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            raise
-        finally:
-            _release_synthesis_slot(synthesis_semaphore)
+            except RuntimeError as exc:
+                if "Dynamic LoRA loading is not compatible" in str(exc):
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                raise
+            finally:
+                _release_synthesis_slot(synthesis_semaphore)
     audio_bytes = await _run_blocking(
         encode_audio,
         result.audio,
@@ -559,6 +564,110 @@ def _release_device_cache(runtime: Any) -> None:
 
 class SynthesisBusyError(RuntimeError):
     """Raised when exclusive access could not be taken before the timeout."""
+
+
+def _profile_peer_urls() -> list[str]:
+    return [
+        value.strip().rstrip("/")
+        for value in str(settings.profile_peer_urls).split(",")
+        if value.strip()
+    ]
+
+
+def _acquire_profile_file_lock(path: str, timeout: float) -> int:
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise RuntimeError("IRODORI_PROFILE_LOCK_PATH requires POSIX fcntl support.") from exc
+
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + max(0.0, timeout)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for the shared profile lock after {timeout:.1f}s."
+                    )
+                time.sleep(0.05)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _release_profile_file_lock(fd: int) -> None:
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+async def _acquire_profile_file_lock_shielded(path: str, timeout: float) -> int:
+    task = asyncio.create_task(_run_blocking(_acquire_profile_file_lock, path, timeout))
+    cancelled = False
+    while True:
+        try:
+            fd = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancelled = True
+    if cancelled:
+        await _run_shielded_blocking(_release_profile_file_lock, fd)
+        raise asyncio.CancelledError
+    return fd
+
+
+async def _unload_profile_peers() -> None:
+    peer_urls = _profile_peer_urls()
+    if not peer_urls:
+        return
+
+    headers = (
+        {"Authorization": f"Bearer {settings.api_key}"}
+        if settings.api_key
+        else {}
+    )
+    timeout = max(0.1, float(settings.profile_switch_timeout))
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for peer_url in peer_urls:
+                response = await client.post(
+                    f"{peer_url}/unload",
+                    headers=headers,
+                    params={"timeout": settings.unload_wait_timeout},
+                )
+                response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not unload a peer Irodori profile: {exc}",
+        ) from exc
+
+
+@asynccontextmanager
+async def _coordinated_synthesis() -> AsyncIterator[None]:
+    lock_path = settings.profile_lock_path
+    if lock_path is None:
+        yield
+        return
+
+    timeout = max(0.0, float(settings.profile_switch_timeout))
+    try:
+        fd = await _acquire_profile_file_lock_shielded(str(lock_path), timeout)
+    except (OSError, RuntimeError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    try:
+        await _unload_profile_peers()
+        yield
+    finally:
+        await _run_shielded_blocking(_release_profile_file_lock, fd)
 
 
 class SynthesisGate:
@@ -878,51 +987,52 @@ def _stream_speech_response(
         try:
             # Held across every chunk: the per-chunk semaphore goes slack between
             # chunks, but this stream keeps using the runtime it resolved here.
-            async with _get_synthesis_gate().synthesis():
-                runtime = await _run_shielded_blocking(runtime_manager.get)
-                for index, chunk in enumerate(chunks):
-                    logger.info(
-                        "speech stream chunk %d/%d started: chars=%d",
-                        index + 1,
-                        len(chunks),
-                        len(chunk),
-                    )
-                    chunk_request = replace(sampling_request, text=chunk)
-                    synthesis_semaphore = await _acquire_synthesis_slot()
-                    try:
-                        result = await _run_shielded_blocking(
-                            _synthesize_once,
-                            runtime,
-                            chunk_request,
+            async with _coordinated_synthesis():
+                async with _get_synthesis_gate().synthesis():
+                    runtime = await _run_shielded_blocking(runtime_manager.get)
+                    for index, chunk in enumerate(chunks):
+                        logger.info(
+                            "speech stream chunk %d/%d started: chars=%d",
+                            index + 1,
+                            len(chunks),
+                            len(chunk),
                         )
-                    finally:
-                        _release_synthesis_slot(synthesis_semaphore)
-                    audio_bytes = await _run_shielded_blocking(
-                        encode_audio,
-                        result.audio,
-                        result.sample_rate,
-                        response_format,
-                    )
-                    completed += 1
-                    logger.info(
-                        "speech stream chunk %d/%d completed: audio_seconds=%.2f bytes=%d",
-                        index + 1,
-                        len(chunks),
-                        _audio_duration_seconds(result.audio, result.sample_rate),
-                        len(audio_bytes),
-                    )
-                    yield _sse_event(
-                        "audio_chunk",
-                        {
-                            "index": index,
-                            "text": chunk,
-                            "format": response_format,
-                            "media_type": CONTENT_TYPES[response_format],
-                            "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
-                            "seed": result.used_seed,
-                            "total_to_decode": result.total_to_decode,
-                        },
-                    )
+                        chunk_request = replace(sampling_request, text=chunk)
+                        synthesis_semaphore = await _acquire_synthesis_slot()
+                        try:
+                            result = await _run_shielded_blocking(
+                                _synthesize_once,
+                                runtime,
+                                chunk_request,
+                            )
+                        finally:
+                            _release_synthesis_slot(synthesis_semaphore)
+                        audio_bytes = await _run_shielded_blocking(
+                            encode_audio,
+                            result.audio,
+                            result.sample_rate,
+                            response_format,
+                        )
+                        completed += 1
+                        logger.info(
+                            "speech stream chunk %d/%d completed: audio_seconds=%.2f bytes=%d",
+                            index + 1,
+                            len(chunks),
+                            _audio_duration_seconds(result.audio, result.sample_rate),
+                            len(audio_bytes),
+                        )
+                        yield _sse_event(
+                            "audio_chunk",
+                            {
+                                "index": index,
+                                "text": chunk,
+                                "format": response_format,
+                                "media_type": CONTENT_TYPES[response_format],
+                                "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+                                "seed": result.used_seed,
+                                "total_to_decode": result.total_to_decode,
+                            },
+                        )
         except RuntimeLoadTimeoutError as exc:
             yield _sse_error_event(str(exc), error_type="server_error", code="runtime_unavailable")
             return
