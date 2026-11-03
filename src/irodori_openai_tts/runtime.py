@@ -5,6 +5,8 @@ import threading
 import time
 from pathlib import Path
 
+import torch
+
 from irodori_tts.inference_runtime import (
     InferenceRuntime,
     RuntimeKey,
@@ -45,7 +47,7 @@ class RuntimeManager:
                 t0 = time.perf_counter()
                 self._checkpoint_path = self._resolve_checkpoint_path()
                 logger.info("checkpoint resolved: %s", self._checkpoint_path)
-                self._runtime = InferenceRuntime.from_key(
+                runtime = InferenceRuntime.from_key(
                     RuntimeKey(
                         checkpoint=self._checkpoint_path,
                         model_device=self._resolve_device(self.settings.model_device),
@@ -59,6 +61,8 @@ class RuntimeManager:
                         compile_dynamic=bool(self.settings.compile_dynamic),
                     )
                 )
+                _release_cuda_load_cache(runtime)
+                self._runtime = runtime
                 elapsed = time.perf_counter() - t0
                 logger.info("runtime loaded in %.2fs", elapsed)
             return self._runtime
@@ -100,3 +104,27 @@ class RuntimeManager:
         if raw in {"", "auto"}:
             return default_runtime_device()
         return str(value)
+
+
+def _release_cuda_load_cache(runtime: InferenceRuntime) -> None:
+    # Loading fp32 weights and then casting them to bf16 can leave large unused
+    # allocations. Release them before inference,
+    # rather than waiting for the post-synthesis cache release interval.
+    devices = {
+        getattr(runtime, "model_device", None),
+        getattr(runtime, "codec_device", None),
+    }
+    for device in devices:
+        if getattr(device, "type", None) != "cuda":
+            continue
+        with torch.cuda.device(device):
+            before = torch.cuda.memory_reserved()
+            torch.cuda.empty_cache()
+            logger.info(
+                "released CUDA load cache: device=%s reserved_before=%d "
+                "reserved_after=%d allocated=%d",
+                device,
+                before,
+                torch.cuda.memory_reserved(),
+                torch.cuda.memory_allocated(),
+            )

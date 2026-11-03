@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from irodori_openai_tts import runtime as runtime_module
 from irodori_openai_tts.config import Settings
@@ -96,3 +99,56 @@ def test_runtime_downloads_hf_checkpoint_when_local_checkpoint_is_unset(monkeypa
     monkeypatch.setattr(runtime_module, "download_hf_checkpoint", fake_download)
 
     assert manager._resolve_checkpoint_path() == "/cache/model.safetensors"
+
+
+@pytest.mark.parametrize(
+    ("model_device", "codec_device", "expected_devices"),
+    [
+        ("cpu", "cpu", set()),
+        ("mps", "mps", set()),
+        ("cuda:0", "cpu", {"cuda:0"}),
+        ("cpu", "cuda:1", {"cuda:1"}),
+        ("cuda:0", "cuda:0", {"cuda:0"}),
+        ("cuda:0", "cuda:1", {"cuda:0", "cuda:1"}),
+    ],
+)
+def test_runtime_releases_cuda_loading_cache_before_serving(
+    tmp_path, monkeypatch, model_device, codec_device, expected_devices
+):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"test")
+    manager = RuntimeManager(Settings(checkpoint=str(checkpoint), _env_file=None))
+    loaded = SimpleNamespace(
+        model_device=torch.device(model_device), codec_device=torch.device(codec_device)
+    )
+    events = []
+    active_devices = []
+
+    def load(_key):
+        events.append("loaded")
+        return loaded
+
+    @contextmanager
+    def cuda_device(device):
+        assert not manager.is_loaded
+        active_devices.append(str(device))
+        yield
+        active_devices.pop()
+
+    def empty_cache():
+        assert not manager.is_loaded
+        events.append(active_devices[-1])
+
+    monkeypatch.setattr(runtime_module.InferenceRuntime, "from_key", staticmethod(load))
+    monkeypatch.setattr(torch.cuda, "device", cuda_device)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 100)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 50)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+
+    assert manager.get() is loaded
+    assert manager.is_loaded
+    assert manager.get() is loaded
+    assert events[0] == "loaded"
+    assert set(events[1:]) == expected_devices
+    assert len(events) == 1 + len(expected_devices)
+    assert active_devices == []
