@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import threading
 
 import pytest
@@ -21,6 +22,11 @@ class FakeRuntime:
         self.requests = []
         self.texts: list[str] = []
         self.thread_ids: list[int] = []
+        self.batch_sizes: list[int] = []
+
+    def synthesize_batch(self, reqs, *, log_fn=None):
+        self.batch_sizes.append(len(reqs))
+        return [self.synthesize(r, log_fn=log_fn) for r in reqs]
 
     def synthesize(self, req, *, log_fn=None):
         self.requests.append(req)
@@ -102,6 +108,17 @@ def test_health_does_not_load_model(tmp_path, monkeypatch):
     assert body["voices"]["dir_exists"] is True
     assert body["defaults"]["chunk_min_chars"] == main.settings.default_chunk_min_chars
     assert body["defaults"]["first_sentence_chunk_min_chars"] is None
+
+
+def test_health_reports_batching_settings(monkeypatch):
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager())
+    monkeypatch.setattr(main.settings, "max_batch_size", 4)
+    monkeypatch.setattr(main.settings, "batch_wait_ms", 15.0)
+
+    body = TestClient(main.app).get("/health").json()
+
+    assert body["runtime"]["max_batch_size"] == 4
+    assert body["runtime"]["batch_wait_ms"] == 15.0
 
 
 def test_models_lists_configured_model():
@@ -643,6 +660,39 @@ def test_speech_returns_503_when_synthesis_queue_times_out(monkeypatch):
     assert runtime.texts == []
 
 
+def test_speech_returns_503_when_batch_queue_times_out(monkeypatch):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    monkeypatch.setattr(main.settings, "max_batch_size", 4)
+    monkeypatch.setattr(main.settings, "synthesis_wait_timeout", 0.0)
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={"model": "irodori-tts", "input": "こんにちは。", "voice": "none"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["message"] == (
+        "Synthesis queue is full. Retry after a moment. timeout=0.0s"
+    )
+    assert runtime.texts == []
+
+
+def test_speech_batch_mode_serves_requests_on_separate_event_loops(monkeypatch):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    monkeypatch.setattr(main.settings, "max_batch_size", 4)
+    monkeypatch.setattr(main.settings, "synthesis_wait_timeout", 1.0)
+    client = TestClient(main.app)
+    body = {"model": "irodori-tts", "input": "こんにちは。", "voice": "none"}
+
+    # Without a context manager, TestClient runs each request on a new event loop.
+    first = client.post("/v1/audio/speech", json=body)
+    second = client.post("/v1/audio/speech", json=body)
+
+    assert (first.status_code, second.status_code) == (200, 200)
+
+
 def test_speech_stream_format_sse_returns_queue_timeout_as_error_event(monkeypatch):
     runtime = FakeRuntime()
     monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
@@ -841,6 +891,38 @@ def test_speech_chunking_splits_only_after_min_chars(monkeypatch):
     assert len(runtime.texts) == 2
     assert runtime.texts[0].endswith("。")
     assert runtime.texts[1] == "最後です。"
+    assert runtime.batch_sizes == []
+
+
+def test_speech_batches_chunks_when_batching_is_enabled(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=main.logger.name)
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    monkeypatch.setattr(main.settings, "max_batch_size", 4)
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "一つ目です。二つ目の文です。三つ目の長い文です。",
+            "voice": "none",
+            "response_format": "pcm",
+            "irodori": {"chunking_enabled": True, "chunk_min_chars": 1},
+        },
+    )
+
+    assert response.status_code == 200
+    assert runtime.texts == ["一つ目です。", "二つ目の文です。", "三つ目の長い文です。"]
+    assert runtime.batch_sizes == [3]
+    assert len(response.content) == 2 * (6 + 8 + 10) * 10
+    assert [m for m in caplog.messages if m.startswith("speech chunk ")] == [
+        "speech chunk 1/3 started: chars=6",
+        "speech chunk 2/3 started: chars=8",
+        "speech chunk 3/3 started: chars=10",
+        "speech chunk 1/3 completed: audio_seconds=0.06",
+        "speech chunk 2/3 completed: audio_seconds=0.08",
+        "speech chunk 3/3 completed: audio_seconds=0.10",
+    ]
 
 
 def test_speech_chunking_uses_first_sentence_min_chars_only_for_first_split(monkeypatch):
@@ -974,6 +1056,61 @@ def test_speech_stream_format_sse_emits_each_chunk(monkeypatch):
     assert events[0][1]["index"] == 0
     assert events[1][1]["index"] == 1
     assert events[2][1] == {"chunks": 2}
+
+
+def test_speech_stream_format_sse_in_batch_mode_emits_each_chunk(monkeypatch):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    monkeypatch.setattr(main.settings, "max_batch_size", 4)
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "一つ目です。二つ目の文です。",
+            "voice": "none",
+            "stream_format": "sse",
+            "irodori": {"chunking_enabled": True, "chunk_min_chars": 1},
+        },
+    )
+
+    assert response.status_code == 200
+    events = sse_events(response.text)
+    assert [event for event, _data in events] == ["audio_chunk", "audio_chunk", "done"]
+    assert [data["text"] for _event, data in events[:2]] == ["一つ目です。", "二つ目の文です。"]
+    assert events[2][1] == {"chunks": 2}
+    assert runtime.batch_sizes == [1, 1]
+
+
+def test_speech_stream_format_sse_in_batch_mode_returns_runtime_error_event(monkeypatch):
+    runtime = FakeRuntime(exc=RuntimeError("boom"))
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    monkeypatch.setattr(main.settings, "max_batch_size", 4)
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "こんにちは。",
+            "voice": "none",
+            "stream_format": "sse",
+        },
+    )
+
+    assert response.status_code == 200
+    assert sse_events(response.text) == [
+        (
+            "error",
+            {
+                "error": {
+                    "message": "boom",
+                    "type": "server_error",
+                    "param": None,
+                    "code": "stream_error",
+                }
+            },
+        )
+    ]
 
 
 def test_speech_chunking_skips_when_seconds_is_explicit(monkeypatch):

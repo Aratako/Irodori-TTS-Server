@@ -287,8 +287,8 @@ Request fields:
 | `irodori` | object | no | Irodori-specific inference options. |
 
 When `stream_format: "sse"` is set, the response is `text/event-stream`.
-The server synthesizes each text chunk sequentially and emits one `audio_chunk`
-event per chunk, followed by a final `done` event:
+The server synthesizes each text chunk sequentially, even with request batching enabled,
+and emits one `audio_chunk` event per chunk, followed by a final `done` event:
 
 For consistent voice tone across chunks, specify a reference voice with `voice`,
 `irodori.ref_wav`, or `irodori.ref_wavs`. Without a reference, each chunk is synthesized
@@ -516,7 +516,9 @@ Set `irodori.first_sentence_chunk_min_chars` to use a smaller threshold only
 for the first sentence. Later sentences keep the normal `chunk_min_chars`
 threshold.
 
-Each chunk is synthesized sequentially, then concatenated into one audio response.
+Chunks are synthesized, then concatenated into one audio response; with
+[request batching](#request-batching) on, the chunks of a non-stream request are
+submitted together.
 
 Per-request override:
 
@@ -549,6 +551,17 @@ IRODORI_SYNTHESIS_WAIT_TIMEOUT=300
 
 If the model is still loading or no synthesis slot becomes available before the configured timeout, the server returns HTTP 503.
 
+### Request Batching
+
+Concurrent requests, and the chunks of one long non-stream request, can share one model call:
+
+```env
+IRODORI_MAX_BATCH_SIZE=4
+IRODORI_BATCH_WAIT_MS=20
+```
+
+When `IRODORI_MAX_BATCH_SIZE` is above `1`, queued requests with compatible sampling options (same steps, CFG, LoRA adapter, speaker kind, and similar settings) run together, up to that many per batch. The server waits at most `IRODORI_BATCH_WAIT_MS` after the oldest queued request for more requests to join. One batch runs at a time, so `IRODORI_MAX_CONCURRENT_SYNTHESIS` is ignored in this mode. `IRODORI_SYNTHESIS_WAIT_TIMEOUT` applies until the first chunk of a request starts. If a batch fails, each request in it is retried alone so that one bad request does not fail the others.
+
 ## Configuration
 
 Server defaults are configured with environment variables. For local runs and Docker Compose, copy `.env.example` to `.env` and edit it as needed.
@@ -575,7 +588,10 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 | `IRODORI_MODEL_LOAD_TIMEOUT` | `300` | Seconds to wait for model loading. |
 | `IRODORI_MAX_CONCURRENT_SYNTHESIS` | `1` | Maximum simultaneous synthesis jobs. |
 | `IRODORI_SYNTHESIS_WAIT_TIMEOUT` | `300` | Seconds to wait for a synthesis slot. |
-| `IRODORI_EMPTY_CACHE_INTERVAL` | `10` | Release the accelerator allocator cache every N syntheses. `0` disables it, `1` releases after every synthesis. |
+| `IRODORI_MAX_BATCH_SIZE` | `1` | Maximum requests or chunks per synthesis batch. `1` disables batching; above `1`, `IRODORI_MAX_CONCURRENT_SYNTHESIS` is ignored. |
+| `IRODORI_BATCH_WAIT_MS` | `20` | Milliseconds to wait for more compatible requests before a batch starts. |
+| `IRODORI_SDPA_CUDNN` | unset | `0` drops cuDNN from masked attention. cuDNN builds an execution plan for each new input length, so variable-length serving on CUDA runs faster with `0`. |
+| `IRODORI_EMPTY_CACHE_INTERVAL` | `10` | Release the accelerator allocator cache every N syntheses. A batch counts as one synthesis. `0` disables it, `1` releases after every synthesis. |
 | `IRODORI_VOICES_DIR` | `voices` | Directory scanned for reference voices. |
 | `IRODORI_DEFAULT_VOICE` | unset | Used when request omits `voice`. |
 | `IRODORI_ALLOW_NO_REF_VOICE` | `true` | Allow `voice: "none"` text-only inference. |
