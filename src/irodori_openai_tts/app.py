@@ -4,6 +4,8 @@ import asyncio
 import base64
 import json
 import logging
+import os
+import signal
 import threading
 import time
 from collections.abc import AsyncIterator, Mapping
@@ -361,6 +363,11 @@ async def create_speech(payload: SpeechRequest) -> Response:
     except RuntimeError as exc:
         if "Dynamic LoRA loading is not compatible" in str(exc):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if _is_mps_out_of_memory(exc):
+            _schedule_process_restart()
+            raise HTTPException(
+                status_code=503, detail="MPS memory exhausted; process restart scheduled."
+            ) from exc
         raise
     finally:
         _release_synthesis_slot(synthesis_semaphore)
@@ -483,6 +490,38 @@ def _synthesize_once(runtime: Any, request: SamplingRequest) -> SamplingResult:
     finally:
         if _empty_cache_due():
             _release_device_cache(runtime)
+
+
+MPS_OUT_OF_MEMORY_MESSAGE = "MPS backend out of memory"
+PROCESS_RESTART_DELAY_SECONDS = 0.25
+_process_restart_lock = threading.Lock()
+_process_restart_scheduled = False
+
+
+def _is_mps_out_of_memory(exc: BaseException) -> bool:
+    return MPS_OUT_OF_MEMORY_MESSAGE in str(exc)
+
+
+def _schedule_process_restart() -> None:
+    """Terminate after the 503 response so launchd can recreate the poisoned MPS process."""
+    global _process_restart_scheduled
+
+    with _process_restart_lock:
+        if _process_restart_scheduled:
+            return
+        _process_restart_scheduled = True
+
+    logger.critical("MPS out of memory; scheduling process restart")
+
+    def terminate() -> None:
+        time.sleep(PROCESS_RESTART_DELAY_SECONDS)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(
+        target=terminate,
+        name="mps-oom-restart",
+        daemon=True,
+    ).start()
 
 
 def _empty_cache_due() -> bool:

@@ -1082,6 +1082,32 @@ def test_empty_cache_due_counts_failed_syntheses(monkeypatch):
     assert released == [runtime]
 
 
+def test_speech_mps_oom_returns_503_and_schedules_restart(monkeypatch):
+    runtime = FakeRuntime(
+        exc=RuntimeError(
+            "MPS backend out of memory (MPS allocated: 7.37 GiB, max allowed: 20.13 GiB)"
+        )
+    )
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    restart_requests: list[bool] = []
+    monkeypatch.setattr(main, "_schedule_process_restart", lambda: restart_requests.append(True))
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "メモリ不足のテストです。",
+            "voice": "none",
+            "response_format": "wav",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["type"] == "server_error"
+    assert "restart scheduled" in response.json()["error"]["message"]
+    assert restart_requests == [True]
+
+
 def test_openai_speed_maps_to_inverse_duration_scale():
     payload = main.SpeechRequest(
         model="irodori-tts",
