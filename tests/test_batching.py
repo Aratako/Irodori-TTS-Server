@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import weakref
 
 import pytest
 
@@ -134,6 +135,35 @@ def test_failed_batch_reruns_each_request_alone():
     assert results[0] == "result:a"
     assert isinstance(results[1], BadRequestError)
     assert results[2] == "result:c"
+
+
+def test_failed_batch_frees_its_memory_before_the_reruns():
+    class Tensor:
+        pass
+
+    class LeakyRunBatch(FakeRunBatch):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batch_tensor = None
+            self.freed_on_rerun: list[bool] = []
+
+        async def __call__(self, runtime, requests):
+            if len(requests) > 1:
+                tensor = Tensor()  # held by the failed frame, like a CUDA tensor on OOM
+                self.batch_tensor = weakref.ref(tensor)
+                raise BadRequestError("out of memory")
+            self.freed_on_rerun.append(self.batch_tensor() is None)
+            return await super().__call__(runtime, requests)
+
+    run_batch = LeakyRunBatch()
+    batcher = make_batcher(run_batch)
+
+    results = submit_all_concurrently(
+        batcher, [SamplingRequest(text="a"), SamplingRequest(text="b")]
+    )
+
+    assert results == ["result:a", "result:b"]
+    assert run_batch.freed_on_rerun == [True, True]
 
 
 def test_queue_timeout_raises_and_never_runs_the_request():

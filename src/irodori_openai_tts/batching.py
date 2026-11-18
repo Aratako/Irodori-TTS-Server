@@ -107,15 +107,18 @@ class SynthesisBatcher:
             for item, result in zip(batch, results, strict=True):
                 if not item.future.done():
                     item.future.set_result(result)
+            return
         except Exception as exc:
             if len(batch) == 1:
                 if not batch[0].future.done():
                     batch[0].future.set_exception(exc)
                 return
-            # Each item settles as soon as its own rerun ends, so callers can react early.
-            for item in batch:
-                if not item.future.done():
-                    await self._run([item])
+        # Rerun outside the except block. Its traceback still references the failed
+        # batch's tensors, which would stay allocated through every rerun after a CUDA OOM.
+        # Each item settles as soon as its own rerun ends, so callers can react early.
+        for item in batch:
+            if not item.future.done():
+                await self._run([item])
 
     async def _next_batch(self) -> list[_Item]:
         loop = asyncio.get_running_loop()
