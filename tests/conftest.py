@@ -17,6 +17,10 @@ def restore_app_globals(monkeypatch, tmp_path):
     monkeypatch.setattr(main.settings, "default_first_sentence_chunk_min_chars", None)
     monkeypatch.setattr(main.settings, "max_concurrent_synthesis", 1)
     monkeypatch.setattr(main.settings, "synthesis_wait_timeout", 300.0)
+    monkeypatch.setattr(main.settings, "max_batch_size", 1)
+    monkeypatch.setattr(main.settings, "batch_wait_ms", 20.0)
     monkeypatch.setattr(main, "_synthesis_semaphore", None)
     monkeypatch.setattr(main, "_synthesis_semaphore_limit", None)
+    monkeypatch.setattr(main, "_synthesis_batcher", None)
+    monkeypatch.setattr(main, "_synthesis_batcher_config", None)
     yield

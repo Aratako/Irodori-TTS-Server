@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from irodori_tts.inference_runtime import SamplingRequest, SamplingResult
 
 from .audio import CONTENT_TYPES, encode_audio, normalize_response_format
+from .batching import QueueTimeoutError, SynthesisBatcher
 from .config import get_settings
 from .runtime import RuntimeLoadTimeoutError, RuntimeManager
 from .voices import VoiceRegistry, VoiceSpec
@@ -30,6 +31,8 @@ logger = logging.getLogger(__name__)
 CHUNK_BOUNDARIES = frozenset("。、，,．.!！?？\n\r")
 _synthesis_semaphore: asyncio.Semaphore | None = None
 _synthesis_semaphore_limit: int | None = None
+_synthesis_batcher: SynthesisBatcher | None = None
+_synthesis_batcher_config: tuple[Any, ...] | None = None
 _empty_cache_lock = threading.Lock()
 _synthesis_since_empty_cache = 0
 
@@ -185,6 +188,8 @@ def health() -> dict[str, Any]:
             "load_timeout": settings.model_load_timeout,
             "max_concurrent_synthesis": settings.max_concurrent_synthesis,
             "synthesis_wait_timeout": settings.synthesis_wait_timeout,
+            "max_batch_size": settings.max_batch_size,
+            "batch_wait_ms": settings.batch_wait_ms,
         },
         "voices": {
             "dir": str(voices_dir),
@@ -353,7 +358,9 @@ async def create_speech(payload: SpeechRequest) -> Response:
         runtime = await _run_blocking(runtime_manager.get)
     except RuntimeLoadTimeoutError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    synthesis_semaphore = await _acquire_synthesis_slot()
+    synthesis_semaphore = None
+    if settings.max_batch_size <= 1:
+        synthesis_semaphore = await _acquire_synthesis_slot()
     try:
         result = await _synthesize_chunks(runtime, sampling_request, chunks)
     except (FileNotFoundError, ValueError) as exc:
@@ -363,7 +370,8 @@ async def create_speech(payload: SpeechRequest) -> Response:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         raise
     finally:
-        _release_synthesis_slot(synthesis_semaphore)
+        if synthesis_semaphore is not None:
+            _release_synthesis_slot(synthesis_semaphore)
     audio_bytes = await _run_blocking(
         encode_audio,
         result.audio,
@@ -485,6 +493,14 @@ def _synthesize_once(runtime: Any, request: SamplingRequest) -> SamplingResult:
             _release_device_cache(runtime)
 
 
+def _synthesize_batch_once(runtime: Any, requests: list[SamplingRequest]) -> list[SamplingResult]:
+    try:
+        return runtime.synthesize_batch(requests, log_fn=_log_runtime_message)
+    finally:
+        if _empty_cache_due():
+            _release_device_cache(runtime)
+
+
 def _empty_cache_due() -> bool:
     """Count this synthesis and report whether a cache release is due."""
     global _synthesis_since_empty_cache
@@ -537,14 +553,46 @@ async def _acquire_synthesis_slot() -> asyncio.Semaphore:
         await asyncio.wait_for(semaphore.acquire(), timeout=timeout)
         return semaphore
     except asyncio.TimeoutError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Synthesis queue is full. Retry after a moment. timeout={timeout:.1f}s",
-        ) from exc
+        raise _synthesis_queue_full_error() from exc
+
+
+def _synthesis_queue_full_error() -> HTTPException:
+    timeout = max(0.0, float(settings.synthesis_wait_timeout))
+    return HTTPException(
+        status_code=503,
+        detail=f"Synthesis queue is full. Retry after a moment. timeout={timeout:.1f}s",
+    )
 
 
 def _release_synthesis_slot(semaphore: asyncio.Semaphore) -> None:
     semaphore.release()
+
+
+def _get_synthesis_batcher() -> SynthesisBatcher:
+    global _synthesis_batcher, _synthesis_batcher_config
+
+    max_batch_size = int(settings.max_batch_size)
+    wait_ms = float(settings.batch_wait_ms)
+    queue_timeout = float(settings.synthesis_wait_timeout)
+    config = (max_batch_size, wait_ms, queue_timeout, asyncio.get_running_loop())
+    if _synthesis_batcher is None or _synthesis_batcher_config != config:
+        _synthesis_batcher = SynthesisBatcher(
+            max_batch_size=max_batch_size,
+            wait_seconds=wait_ms / 1000.0,
+            queue_timeout=queue_timeout,
+            run_batch=partial(_run_blocking, _synthesize_batch_once),
+        )
+        _synthesis_batcher_config = config
+    return _synthesis_batcher
+
+
+async def _synthesize_batched(
+    runtime: Any, requests: list[SamplingRequest]
+) -> list[SamplingResult]:
+    try:
+        return await _get_synthesis_batcher().submit_all(runtime, requests)
+    except QueueTimeoutError as exc:
+        raise _synthesis_queue_full_error() from exc
 
 
 def _speech_chunks(payload: SpeechRequest, sampling_request: SamplingRequest) -> list[str]:
@@ -644,6 +692,22 @@ async def _synthesize_chunks(
     sampling_request: SamplingRequest,
     chunks: list[str],
 ) -> SamplingResult:
+    if settings.max_batch_size > 1:
+        if len(chunks) == 1:
+            return (await _synthesize_batched(runtime, [sampling_request]))[0]
+        chunk_requests = [replace(sampling_request, text=chunk) for chunk in chunks]
+        for index, chunk in enumerate(chunks, start=1):
+            logger.info("speech chunk %d/%d started: chars=%d", index, len(chunks), len(chunk))
+        results = await _synthesize_batched(runtime, chunk_requests)
+        for index, result in enumerate(results, start=1):
+            logger.info(
+                "speech chunk %d/%d completed: audio_seconds=%.2f",
+                index,
+                len(chunks),
+                _audio_duration_seconds(result.audio, result.sample_rate),
+            )
+        return _merge_chunk_results(results)
+
     if len(chunks) == 1:
         return await _run_blocking(
             _synthesize_once,
@@ -667,7 +731,10 @@ async def _synthesize_chunks(
             _audio_duration_seconds(chunk_result.audio, chunk_result.sample_rate),
         )
         results.append(chunk_result)
+    return _merge_chunk_results(results)
 
+
+def _merge_chunk_results(results: list[SamplingResult]) -> SamplingResult:
     sample_rate = results[0].sample_rate
     if any(result.sample_rate != sample_rate for result in results):
         raise RuntimeError("Chunk sample rates did not match.")
@@ -708,15 +775,18 @@ def _stream_speech_response(
                     len(chunk),
                 )
                 chunk_request = replace(sampling_request, text=chunk)
-                synthesis_semaphore = await _acquire_synthesis_slot()
-                try:
-                    result = await _run_stream_blocking(
-                        _synthesize_once,
-                        runtime,
-                        chunk_request,
-                    )
-                finally:
-                    _release_synthesis_slot(synthesis_semaphore)
+                if settings.max_batch_size > 1:
+                    result = (await _synthesize_batched(runtime, [chunk_request]))[0]
+                else:
+                    synthesis_semaphore = await _acquire_synthesis_slot()
+                    try:
+                        result = await _run_stream_blocking(
+                            _synthesize_once,
+                            runtime,
+                            chunk_request,
+                        )
+                    finally:
+                        _release_synthesis_slot(synthesis_semaphore)
                 audio_bytes = await _run_stream_blocking(
                     encode_audio,
                     result.audio,
